@@ -6,7 +6,7 @@ from typing import List
 from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, Text, select, update, text, or_, func, distinct, case
+from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, Text, select, update, text, or_, func, distinct, case, delete, BIGINT
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.declarative import as_declarative, declared_attr
 from config import *
@@ -153,7 +153,33 @@ class WalletSummary(Base):
 
     def as_dict(self):
         return {c.name: getattr(self, c.name) for c in self.__table__.columns}
-    
+
+class Holding(Base):
+    __tablename__ = 'wallet_holding'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    wallet_address = Column(String(255), nullable=False)  # 添加长度限制
+    token_address = Column(String(255), nullable=False)  # 添加长度限制
+    token_icon = Column(String(255), nullable=True)  # 添加长度限制
+    token_name = Column(String(255), nullable=True)  # 添加长度限制
+    chain = Column(String(50), nullable=False, default='Unknown')  # 添加长度限制
+    amount = Column(Float, nullable=False, default=0.0)
+    value = Column(Float, nullable=False, default=0.0)
+    value_USDT = Column(Float, nullable=False, default=0.0)
+    unrealized_profits = Column(Float, nullable=False, default=0.0)
+    pnl = Column(Float, nullable=False, default=0.0)
+    pnl_percentage = Column(Float, nullable=False, default=0.0)
+    avg_price = Column(Float, nullable=False, default=0.0)
+    marketcap = Column(Float, nullable=False, default=0.0)
+    is_cleared = Column(Boolean, nullable=False, default=False)
+    cumulative_cost = Column(Float, nullable=False, default=0.0)
+    cumulative_profit = Column(Float, nullable=False, default=0.0)
+    last_transaction_time = Column(BIGINT, nullable=True, comment='最後活躍時間')
+    time = Column(DateTime, nullable=False, default=get_utc8_time, comment='更新時間')
+
+    def as_dict(self):
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
 class ErrorLog(Base):
     """
     錯誤訊息記錄表
@@ -321,7 +347,84 @@ async def write_wallet_data_to_db(session, wallet_data, chain):
     except Exception as e:
         print(f"Error saving wallet: {wallet_data['wallet_address']} - {str(e)}")
         return False
-    
+
+async def save_holding(tx_data_list: list, wallet_address: str, session: AsyncSession, chain: str):
+    """Save transaction record to the database, and delete tokens no longer held in bulk"""
+    try:
+        schema = chain.lower()
+        Holding.with_schema(schema)
+
+        # 查询数据库中钱包的所有持仓
+        existing_holdings = await session.execute(
+            select(Holding).filter(Holding.wallet_address == wallet_address)
+        )
+        existing_holdings = existing_holdings.scalars().all()
+
+        # 提取数据库中现有的 token_address 集合
+        existing_token_addresses = {holding.token_address for holding in existing_holdings}
+
+        # 提取 tx_data_list 中当前持有的 token_address 集合
+        current_token_addresses = {token.get("token_address") for token in tx_data_list}
+
+        # 计算需要删除的 tokens
+        tokens_to_delete = existing_token_addresses - current_token_addresses
+
+        # 删除不再持有的代币记录
+        if tokens_to_delete:
+            await session.execute(
+                delete(Holding).filter(
+                    Holding.wallet_address == wallet_address,
+                    Holding.token_address.in_(tokens_to_delete)
+                )
+            )
+
+        # 更新或新增持仓
+        for token_data in tx_data_list:
+            token_address = token_data.get("token_address")
+            if not token_address:
+                print(f"Invalid token data: {token_data}")
+                continue
+
+            existing_holding = next((h for h in existing_holdings if h.token_address == token_address), None)
+
+            holding_data = {
+                "wallet_address": wallet_address,
+                "token_address": token_address,
+                "token_icon": token_data.get('token_icon', ''),
+                "token_name": token_data.get('token_name', ''),
+                "chain": token_data.get('chain', 'Unknown'),
+                "amount": token_data.get('amount', 0),
+                "value": token_data.get('value', 0),
+                "value_USDT": token_data.get('value_USDT', 0),
+                "unrealized_profits": token_data.get('unrealized_profit', 0),
+                "pnl": token_data.get('pnl', 0),
+                "pnl_percentage": token_data.get('pnl_percentage', 0),
+                "avg_price": token_data.get('avg_price', 0),
+                "marketcap": token_data.get('marketcap', 0),
+                "is_cleared": token_data.get('sell_amount', 0) >= token_data.get('buy_amount', 0),
+                "cumulative_cost": token_data.get('cost', 0),
+                "cumulative_profit": token_data.get('profit', 0),
+                "last_transaction_time": make_naive_time(token_data.get('last_transaction_time', datetime.now())),
+                "time": make_naive_time(token_data.get('time', datetime.now())),
+            }
+
+            if existing_holding:
+                # 更新现有记录
+                for key, value in holding_data.items():
+                    setattr(existing_holding, key, value)
+            else:
+                # 新增记录
+                holding = Holding(**holding_data)
+                session.add(holding)
+
+        # 提交数据库变更
+        await session.commit()
+
+    except Exception as e:
+        # 错误处理
+        await session.rollback()
+        print(f"Error while saving holding for wallet {wallet_address}: {str(e)}")
+
 async def log_error(session, error_message: str, module_name: str, function_name: str = None, additional_info: str = None):
     """記錄錯誤訊息到資料庫"""
     schema = "BSC".lower()

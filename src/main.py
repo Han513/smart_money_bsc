@@ -246,7 +246,7 @@ async def analyze_wallets_data(wallet_stats, bnb_price):
             token_info_results = {
                 token: executor.submit(fetcher.get_token_info, token) for token in remaining_tokens
             }
-        remaining_tokens_summary = {}
+        tx_data_list = []
         for token, data in remaining_tokens.items():
             # 獲取查詢結果
             token_info = token_info_results[token].result()
@@ -276,7 +276,8 @@ async def analyze_wallets_data(wallet_stats, bnb_price):
             token_info_price_usd = Decimal(str(token_info.get("priceUsd", 0)))
 
             # 統計結果
-            remaining_tokens_summary[token] = {
+            remaining_tokens_summary = {
+                "token_address": token,
                 "token_name": token_info.get("symbol", "Unknown"),
                 "token_icon": token_info.get("url", "no url"),
                 "chain": "BSC",
@@ -294,6 +295,7 @@ async def analyze_wallets_data(wallet_stats, bnb_price):
                 "time": make_naive_time(datetime.now()),
                 "avg_price": avg_price,  # 該錢包在該代幣上的買入均價
             }
+            tx_data_list.append(remaining_tokens_summary)
 
         return wallet, {
             'balance': balances[wallet]['balance'],
@@ -325,7 +327,7 @@ async def analyze_wallets_data(wallet_stats, bnb_price):
             'update_time': get_update_time(),
             'last_transaction': stats['last_transaction'],
             'is_active': True,
-            'remaining_tokens': remaining_tokens_summary,
+            'remaining_tokens': tx_data_list,
         }
 
     tasks = [process_wallet(wallet, stats) for wallet, stats in wallet_stats.items()]
@@ -340,8 +342,10 @@ async def process_and_save_wallets(filtered_wallet_analysis, session, chain):
     """
     for wallet_address, wallet_data in filtered_wallet_analysis.items():
         wallet_data['wallet_address'] = wallet_address
+        tx_data_list = wallet_data['remaining_tokens']
         try:
             await write_wallet_data_to_db(session, wallet_data, chain)
+            await save_holding(tx_data_list, wallet_address, session, chain)
         except Exception as e:
             print(f"Failed to save wallet: {wallet_address} - {str(e)}")
 
