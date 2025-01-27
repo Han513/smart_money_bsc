@@ -10,16 +10,9 @@ from decimal import Decimal
 from balance import *
 from models import *
 from config import *
-from sqlalchemy import text, table, select
-from typing import List, Dict, Any
-
-# 初始化 PostgreSQL 連接
-engine = create_async_engine(DATABASE_URI, echo=False)
-async_session = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
-trades_table = table("trades")
-
-my_engine = create_async_engine(DATABASE_URI_SWAP_BSC, echo=False)
-my_async_session = sessionmaker(bind=my_engine, class_=AsyncSession, expire_on_commit=False)
+from sqlalchemy import text
+from typing import List, Dict
+from token_info import *
 
 def log_execution_time(func):
     @wraps(func)
@@ -40,47 +33,24 @@ def get_update_time():
     # 格式化时间为字符串，格式可根据需要调整
     return utc_plus_8.strftime("%Y-%m-%d %H:%M:%S")
 
-class DecimalEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, Decimal):
-            return float(obj)  # 将 Decimal 转换为 float
-        return super(DecimalEncoder, self).default(obj)
+def make_naive_time(dt):
+    """将带时区的时间转换为无时区时间"""
+    if isinstance(dt, datetime) and dt.tzinfo is not None:
+        return dt.replace(tzinfo=None)
+    return dt
 
-# 格式化输出结果
-def pretty_print(data):
-    print(json.dumps(data, cls=DecimalEncoder, indent=4))
-
-# 數據清理函數
-async def clean_data(session, limit, offset):
-    query = (
-        select("*")
-        .select_from(trades_table)  # 使用声明的表结构
-        .where(
-            text("""
-            token_in IN ('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', '0x55d398326f99059fF775485246999027B3197955', '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d')
-            OR token_out IN ('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', '0x55d398326f99059fF775485246999027B3197955', '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d')
-            """)
-        )
-        .limit(limit)
-        .offset(offset)
-    )
-    result = await session.execute(query)
-    return result.mappings().all()  # 将结果映射为字典
-
-# 統計每個錢包的交易紀錄
 async def calculate_wallet_stats(data, bnb_price):
     wallet_stats = {}
-    
+
     for row in data:
-        wallet = row['signer']  # 現在可以用字典鍵訪問
+        wallet = row['signer']
         token_in = row['token_in']
         token_out = row['token_out']
         amount_in = Decimal(row['amount_in']) / (10 ** row['decimals_in'])
         amount_out = Decimal(row['amount_out']) / (10 ** row['decimals_out'])
         price_usd = Decimal(row['price_usd'])
-        timestamp = int(row['created_at'])  # 確保 timestamp 是整數格式
+        timestamp = int(row['created_at'])
 
-        # 判斷交易方向
         if token_in in ('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', 
                         '0x55d398326f99059fF775485246999027B3197955', 
                         '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d'):
@@ -91,10 +61,33 @@ async def calculate_wallet_stats(data, bnb_price):
             action = 'sell'
 
         if wallet not in wallet_stats:
-            wallet_stats[wallet] = {'buy': [], 'sell': [], 'pnl': Decimal(0), 'last_transaction': None, 'tokens': set()}
+            wallet_stats[wallet] = {
+                'buy': [],
+                'sell': [],
+                'pnl': Decimal(0),
+                'last_transaction': None,
+                'tokens': set(),
+                'remaining_tokens': {},  # 用於統計剩餘代幣
+            }
 
-        wallet_stats[wallet][action].append({'token': token_out if action == 'buy' else token_in, 'value': value, 'timestamp': timestamp})
-        wallet_stats[wallet]['tokens'].add(token_out if action == 'buy' else token_in)
+        # 更新剩餘代幣的數量和價值
+        token = token_out if action == 'buy' else token_in
+        if action == 'buy':
+            # 確保 token 有正確初始化
+            wallet_stats[wallet]['remaining_tokens'].setdefault(token, {
+                'amount': Decimal(0), 'cost': Decimal(0), 'profit': Decimal(0)
+            })
+            wallet_stats[wallet]['remaining_tokens'][token]['amount'] += amount_in
+            wallet_stats[wallet]['remaining_tokens'][token]['cost'] += value
+
+        elif action == 'sell':
+            if token in wallet_stats[wallet]['remaining_tokens']:
+                wallet_stats[wallet]['remaining_tokens'][token]['amount'] -= amount_out
+                wallet_stats[wallet]['remaining_tokens'][token]['profit'] += value
+
+        # 更新其他字段
+        wallet_stats[wallet][action].append({'token': token, 'value': value, 'timestamp': timestamp})
+        wallet_stats[wallet]['tokens'].add(token)
         wallet_stats[wallet]['last_transaction'] = (
             timestamp if wallet_stats[wallet]['last_transaction'] is None
             else max(wallet_stats[wallet]['last_transaction'], timestamp)
@@ -105,10 +98,19 @@ async def calculate_wallet_stats(data, bnb_price):
             wallet_stats[wallet]['pnl'] += value
         else:
             wallet_stats[wallet]['pnl'] -= value
+
+    # 清理剩餘代幣中數量為 0 的代幣
+    for wallet, stats in wallet_stats.items():
+        stats['remaining_tokens'] = {
+            token: data
+            for token, data in stats['remaining_tokens'].items()
+            if data['amount'] > 0
+        }
+
     return wallet_stats
 
-@log_execution_time
-async def analyze_wallets(wallet_stats, bnb_price):
+# @log_execution_time
+async def analyze_wallets_data(wallet_stats, bnb_price):
     wallet_analysis = {}
     current_time = int(time.time() * 1000)  # 当前时间戳（毫秒）
 
@@ -207,7 +209,7 @@ async def analyze_wallets(wallet_stats, bnb_price):
 
             for tx in sell_filtered:
                 if num_buy > 0:  # 检查 num_buy 是否为有效值
-                    pnl_percentage = ((tx['value'] - (total_buy_dec / Decimal(num_buy))) / total_buy_dec) * Decimal(100)
+                    pnl_percentage = ((tx['value'] - total_buy_dec) / total_buy_dec) * Decimal(100)
                 else:
                     pnl_percentage = Decimal(0)  # 如果 num_buy 为 0，则直接设置 pnl_percentage 为 0
 
@@ -235,6 +237,63 @@ async def analyze_wallets(wallet_stats, bnb_price):
 
         # 获取钱包余额
         balances = await fetch_wallet_balances([wallet], bnb_price)
+
+        remaining_tokens = stats['remaining_tokens']
+        fetcher = TokenInfoFetcher()
+
+        # 查詢代幣即時信息
+        with ThreadPoolExecutor() as executor:
+            token_info_results = {
+                token: executor.submit(fetcher.get_token_info, token) for token in remaining_tokens
+            }
+        remaining_tokens_summary = {}
+        for token, data in remaining_tokens.items():
+            # 獲取查詢結果
+            token_info = token_info_results[token].result()
+            
+            amount = data.get("amount", Decimal(0))
+            profit = data.get("profit", Decimal(0))
+            cost = data.get("cost", Decimal(0))
+
+            # 計算最後一筆交易時間
+            last_transaction_time = max(
+                tx['timestamp'] for tx in (stats['buy'] + stats['sell']) if tx['token'] == token
+            )
+
+            # 計算買入均價
+            buy_transactions = [
+                {
+                    'amount': remaining_tokens[token]['amount'],
+                    'cost': remaining_tokens[token]['cost']
+                } 
+                for token in remaining_tokens
+            ]
+
+            total_buy_value = sum(tx['cost'] for tx in buy_transactions)
+            total_buy_amount = sum(tx['amount'] for tx in buy_transactions if tx['amount'] > 0)
+            avg_price = total_buy_value / total_buy_amount if total_buy_amount > 0 else 0
+            token_info_price_native = Decimal(str(token_info.get("priceNative", 0)))
+            token_info_price_usd = Decimal(str(token_info.get("priceUsd", 0)))
+
+            # 統計結果
+            remaining_tokens_summary[token] = {
+                "token_name": token_info.get("symbol", "Unknown"),
+                "token_icon": token_info.get("url", "no url"),
+                "chain": "BSC",
+                "amount": amount,
+                "value": amount  * token_info_price_native,  # 以最新價格計算價值
+                "value_USDT": amount  * token_info_price_usd,  # 以最新價格計算價值
+                "unrealized_profits": amount  * token_info_price_usd,  # 以最新價格計算價值
+                "pnl": profit - data["cost"],
+                "pnl_percentage": (profit - data["cost"]) / data["cost"] * 100 if data["cost"] > 0 else 0,
+                "marketcap": token_info.get("marketcap", 0),
+                "is_cleared": 0,
+                "cumulative_cost": data["cost"],
+                "cumulative_profit": profit,
+                "last_transaction_time": last_transaction_time,  # 最後一筆交易時間
+                "time": make_naive_time(datetime.now()),
+                "avg_price": avg_price,  # 該錢包在該代幣上的買入均價
+            }
 
         return wallet, {
             'balance': balances[wallet]['balance'],
@@ -265,214 +324,199 @@ async def analyze_wallets(wallet_stats, bnb_price):
             'distribution_percentage_30d': distribution_percentage_30d,
             'update_time': get_update_time(),
             'last_transaction': stats['last_transaction'],
-            'is_active': True
+            'is_active': True,
+            'remaining_tokens': remaining_tokens_summary,
         }
 
     tasks = [process_wallet(wallet, stats) for wallet, stats in wallet_stats.items()]
     results = await asyncio.gather(*tasks)
 
     wallet_analysis = {wallet: analysis for wallet, analysis in results}
-    print(wallet_analysis)
     return wallet_analysis
 
 async def process_and_save_wallets(filtered_wallet_analysis, session, chain):
     """
-    处理 filtered_wallet_analysis 数据并保存到数据库
+    Process filtered_wallet_analysis data and save to database
     """
     for wallet_address, wallet_data in filtered_wallet_analysis.items():
-        wallet_data['wallet_address'] = wallet_address  # 将字典键添加为 `wallet_address`
-        success = await write_wallet_data_to_db(session, wallet_data, chain)
-        if not success:
-            print(f"Failed to save wallet: {wallet_address}")
+        wallet_data['wallet_address'] = wallet_address
+        try:
+            await write_wallet_data_to_db(session, wallet_data, chain)
+        except Exception as e:
+            print(f"Failed to save wallet: {wallet_address} - {str(e)}")
 
-async def get_time_range(session) -> tuple:
-    """获取数据库中最早和最新的created_at时间戳"""
-    query = """
-    SELECT 
-        MIN(created_at) as min_time, 
-        MAX(created_at) as max_time 
-    FROM bsc_dex.trades 
-    WHERE created_at > 0
-    AND (
-        token_in IN ('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', 
-                    '0x55d398326f99059fF775485246999027B3197955', 
-                    '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d')
-        OR 
-        token_out IN ('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', 
-                     '0x55d398326f99059fF775485246999027B3197955', 
-                     '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d')
-    )
-    """
-    result = await session.execute(text(query))
-    row = result.first()
-    if row.min_time is None or row.max_time is None:
-        raise ValueError("No valid data found in the specified time range")
-    return row.min_time, row.max_time
+# 性能優化配置
+class PerformanceConfig:
+    MAX_CONCURRENT_TASKS = 20  # 並發任務數
+    CHUNK_SIZE = 1000  # 批次處理數量
+    LOGGING_INTERVAL = 100  # 日誌記錄間隔
 
-async def get_data_chunk(session, start_time: int, end_time: int, batch_size: int = 1000) -> List[Dict]:
-    """获取指定created_at时间范围内的数据块"""
-    query = f"""
-    SELECT *
-    FROM bsc_dex.trades
-    WHERE created_at > 0
-    AND (
-        token_in IN ('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', 
-                    '0x55d398326f99059fF775485246999027B3197955', 
-                    '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d')
-        OR 
-        token_out IN ('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', 
-                     '0x55d398326f99059fF775485246999027B3197955', 
-                     '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d')
-    )
-    AND created_at BETWEEN :start_time AND :end_time
-    ORDER BY created_at ASC
-    LIMIT :limit
-    """
-    result = await session.execute(
-        text(query),
-        {"start_time": start_time, "end_time": end_time, "limit": batch_size}
-    )
-    return result.mappings().all()
-
-async def process_time_chunk(session, start_time: int, end_time: int, bnb_price: Decimal) -> Dict:
-    """处理特定created_at时间范围内的数据"""
-    all_chunk_data = []
-    batch_size = 1000
-    last_timestamp = start_time - 1
-    
-    while True:
-        chunk_data = await get_data_chunk(session, last_timestamp + 1, end_time, batch_size)
-        if not chunk_data:
-            break
+class WalletAnalyzer:
+    def __init__(self, database_uri, swap_database_uri):
+        # 創建連接池
+        self.engine = create_async_engine(
+            database_uri, 
+            pool_size=20,
+            max_overflow=10,
+            pool_timeout=30,
+            pool_recycle=1800,
+            echo=False
+        )
+        self.swap_engine = create_async_engine(
+            swap_database_uri,
+            pool_size=20,
+            max_overflow=10,
+            pool_timeout=30,
+            pool_recycle=1800,
+            echo=False
+        )
         
-        all_chunk_data.extend(chunk_data)
+        self.async_session = sessionmaker(
+            bind=self.engine, 
+            class_=AsyncSession, 
+            expire_on_commit=False
+        )
+        self.swap_async_session = sessionmaker(
+            bind=self.swap_engine, 
+            class_=AsyncSession, 
+            expire_on_commit=False
+        )
         
-        # 更新最后处理的时间戳
-        last_timestamp = chunk_data[-1]['created_at']
+        # 設置日誌
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s: %(message)s'
+        )
+        self.logger = logging.getLogger(__name__)
+
+    async def get_unique_wallets(self, session) -> List[str]:
+        """獲取所有唯一錢包地址"""
+        query = """
+        SELECT DISTINCT signer 
+        FROM bsc_dex.trades 
+        WHERE (
+            token_in IN ('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', 
+                        '0x55d398326f99059fF775485246999027B3197955', 
+                        '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d')
+            OR 
+            token_out IN ('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', 
+                         '0x55d398326f99059fF775485246999027B3197955', 
+                         '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d')
+        )
+        """
+        result = await session.execute(text(query))
+        return [row[0] for row in result]
+
+    async def process_wallet(self, wallet: str, bnb_price: Decimal) -> Dict:
+        """處理單個錢包"""
+        async with self.async_session() as session:
+            async with session.begin():
+                await session.execute(text("SET search_path TO bsc_dex;"))
+                wallet_trades = await self.get_wallet_trades(session, wallet)
         
-        # 如果获取的数据量小于batch_size或已经达到结束时间，退出循环
-        if len(chunk_data) < batch_size or last_timestamp >= end_time:
-            break
-            
-        # 添加进度日志
-        print(f"Processed up to {datetime.fromtimestamp(last_timestamp/1000)} ({len(all_chunk_data)} records)")
+        if not wallet_trades:
+            return None
 
-    if not all_chunk_data:
-        return {}
+        async with self.async_session() as session:
+            async with session.begin():
+                wallet_stats = await calculate_wallet_stats(wallet_trades, bnb_price)
+                wallet_analysis = await analyze_wallets_data(wallet_stats, bnb_price)
 
-    # 处理数据块
-    wallet_stats = await calculate_wallet_stats(all_chunk_data, bnb_price)
-    return await analyze_wallets(wallet_stats, bnb_price)
+        return wallet_analysis
 
-async def merge_wallet_stats(existing_stats: Dict, new_stats: Dict):
-    """合并钱包统计数据"""
-    # 更新基本统计信息
-    existing_stats['total_tokens'] = len(
-        set(existing_stats['token_list'].split(',')) | 
-        set(new_stats['token_list'].split(','))
-    )
-    
-    # 更新时间相关统计
-    existing_stats['last_transaction'] = max(
-        existing_stats['last_transaction'],
-        new_stats['last_transaction']
-    )
-    
-    # 合并其他统计数据
-    for period in ['1d', '7d', '30d']:
-        stats_key = f'stats_{period}'
-        if stats_key in existing_stats and stats_key in new_stats:
-            existing_stats[stats_key]['total_cost'] += new_stats[stats_key]['total_cost']
-            existing_stats[stats_key]['pnl'] += new_stats[stats_key]['pnl']
-            existing_stats[stats_key]['total_transaction_num'] += new_stats[stats_key]['total_transaction_num']
-            
-            # 重新计算平均值和百分比
-            existing_stats[stats_key]['avg_cost'] = (
-                existing_stats[stats_key]['total_cost'] / 
-                existing_stats[stats_key]['total_transaction_num']
-                if existing_stats[stats_key]['total_transaction_num'] > 0 else 0
-            )
-            existing_stats[stats_key]['pnl_percentage'] = (
-                existing_stats[stats_key]['pnl'] / 
-                existing_stats[stats_key]['total_cost'] * 100
-                if existing_stats[stats_key]['total_cost'] > 0 else 0
-            )
+    # async def save_wallet_data(self, wallet_analysis: Dict):
+    #     """保存錢包分析結果"""
+    #     async with self.swap_async_session() as db_session:
+    #         async with db_session.begin():
+    #             filtered_wallet_analysis = {
+    #                 wallet: data for wallet, data in wallet_analysis.items()
+    #                 if data['total_tokens'] >= 5 and data['stats_30d']['win_rate'] > 40
+    #             }
+                
+    #             if filtered_wallet_analysis:
+    #                 await process_and_save_wallets(
+    #                     filtered_wallet_analysis, 
+    #                     db_session, 
+    #                     chain="BSC"
+    #                 )
 
-# 主程序
+    async def analyze_wallets(self, bnb_price: Decimal):
+        """主分析流程"""
+        start_time = time.time()
+        
+        # 獲取唯一錢包
+        async with self.async_session() as session:
+            async with session.begin():
+                unique_wallets = await self.get_unique_wallets(session)
+        
+        total_wallets = len(unique_wallets)
+        self.logger.info(f"開始分析 {total_wallets} 個錢包")
+
+        # 創建信號量控制並發
+        semaphore = asyncio.Semaphore(PerformanceConfig.MAX_CONCURRENT_TASKS)
+        processed_wallets = 0
+
+        async def process_wallet_with_semaphore(wallet):
+            nonlocal processed_wallets
+            async with semaphore:
+                try:
+                    wallet_analysis = await self.process_wallet(wallet, bnb_price)
+                    if wallet_analysis:
+                        # 為每個錢包創建新的會話
+                        async with self.swap_async_session() as db_session:
+                            async with db_session.begin():
+                                filtered_wallet_analysis = {
+                                    wallet: data for wallet, data in wallet_analysis.items()
+                                    if data['total_tokens'] >= 5 and data['stats_30d']['win_rate'] > 40
+                                }
+                                
+                                if filtered_wallet_analysis:
+                                    await process_and_save_wallets(
+                                        filtered_wallet_analysis, 
+                                        db_session, 
+                                        chain="BSC"
+                                    )
+                    
+                    processed_wallets += 1
+                    if processed_wallets % PerformanceConfig.LOGGING_INTERVAL == 0:
+                        self.logger.info(f"已處理 {processed_wallets}/{total_wallets} 個錢包")
+                except Exception as e:
+                    self.logger.error(f"錢包 {wallet} 處理失敗: {str(e)}")
+
+        # 分批處理錢包
+        for i in range(0, total_wallets, PerformanceConfig.CHUNK_SIZE):
+            chunk = unique_wallets[i:i + PerformanceConfig.CHUNK_SIZE]
+            tasks = [process_wallet_with_semaphore(wallet) for wallet in chunk]
+            await asyncio.gather(*tasks)
+
+        end_time = time.time()
+        self.logger.info(f"總處理時間: {end_time - start_time:.2f} 秒")
+
+    async def get_wallet_trades(self, session, wallet_address):
+        """獲取特定錢包的所有交易紀錄"""
+        query = """
+        SELECT * 
+        FROM bsc_dex.trades 
+        WHERE signer = :wallet_address
+        AND (
+            token_in IN ('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', 
+                        '0x55d398326f99059fF775485246999027B3197955', 
+                        '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d')
+            OR 
+            token_out IN ('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', 
+                         '0x55d398326f99059fF775485246999027B3197955', 
+                         '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d')
+        )
+        ORDER BY created_at ASC
+        """
+        result = await session.execute(text(query), {'wallet_address': wallet_address})
+        return result.mappings().all()
+
 async def main():
-    chunk_size = timedelta(days=7).total_seconds() * 1000
-    async with async_session() as session:
-        async with session.begin():
-            bnb_price = await get_price()
-            await session.execute(text("SET search_path TO bsc_dex;"))
-            
-            # # 分页获取数据
-            # limit = 1000
-            # offset = 0
-            # all_data = []
+    bnb_price = await get_price()
 
-            # while True:
-            #     cleaned_data = await clean_data(session, limit=limit, offset=offset)
-            #     print(cleaned_data)
-            #     if not cleaned_data:  # 没有更多数据时结束循环
-            #         break
-            #     all_data.extend(cleaned_data)
-            #     offset += limit
+    analyzer = WalletAnalyzer(DATABASE_URI, DATABASE_URI_SWAP_BSC)
+    await analyzer.analyze_wallets(bnb_price)
 
-            # # 统计每个钱包的交易记录
-            # wallet_stats = await calculate_wallet_stats(all_data, bnb_price)
-            
-            # # 分析每个钱包
-            # wallet_analysis = await analyze_wallets(wallet_stats, bnb_price)
-
-            # # 筛选分析结果
-            # filtered_wallet_analysis = {
-            #     wallet: data for wallet, data in wallet_analysis.items()
-            #     if 'stats_30d' in data  # 确保 metrics_30d 存在
-            #     and data['total_tokens'] >= 5  # 条件1: 交易过的币种需至少大于或等于 5 种
-            #     and data['stats_30d']['win_rate'] > 40  # 条件3: 胜率大于 40
-            # }
-
-            min_time, max_time = await get_time_range(session)
-            print(min_time)
-            print(max_time)
-            
-            # 创建时间块
-            current_start = min_time
-            all_wallet_analysis = {}
-            
-            while current_start < max_time:
-                current_end = min(current_start + chunk_size, max_time)
-                print(f"Processing data from {datetime.fromtimestamp(current_start/1000)} to {datetime.fromtimestamp(current_end/1000)}")
-                
-                # 处理当前时间块
-                chunk_analysis = await process_time_chunk(session, current_start, current_end, bnb_price)
-                
-                # 合并结果
-                for wallet, data in chunk_analysis.items():
-                    if wallet not in all_wallet_analysis:
-                        all_wallet_analysis[wallet] = data
-                    else:
-                        # 更新现有钱包的统计数据
-                        await merge_wallet_stats(all_wallet_analysis[wallet], data)
-                
-                current_start = current_end + 1
-                
-            # 筛选最终结果
-            filtered_wallet_analysis = {
-                wallet: data for wallet, data in all_wallet_analysis.items()
-                if data['total_tokens'] >= 5 and data['stats_30d']['win_rate'] > 40
-            }
-
-            # 打印筛选后的结果
-            pretty_print(filtered_wallet_analysis)
-
-        # 保存筛选后的数据到数据库
-        async with my_async_session() as db_session:
-            await process_and_save_wallets(filtered_wallet_analysis, db_session, chain="BSC")
-        print("All filtered wallet data saved to the database.")
-
-# 運行程式
 if __name__ == "__main__":
     asyncio.run(main())
-

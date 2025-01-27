@@ -69,7 +69,9 @@ class WalletSummary(Base):
     整合的錢包數據表
     """
     __tablename__ = 'wallet'
-    # __table_args__ = {'schema': 'solana'}
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
     id = Column(Integer, primary_key=True, comment='ID')
     address = Column(String(100), nullable=False, unique=True, comment='錢包地址')
@@ -245,7 +247,6 @@ async def write_wallet_data_to_db(session, wallet_data, chain):
             existing_wallet.update_time = get_utc8_time()
             existing_wallet.last_transaction_time = wallet_data.get("last_transaction_time", int(datetime.now(timezone.utc).timestamp()))
 
-            await session.commit()
             print(f"Successfully updated wallet: {wallet_data['wallet_address']}")
         else:
             # 如果不存在，就創建新記錄，直接複用現有更新邏輯
@@ -313,13 +314,11 @@ async def write_wallet_data_to_db(session, wallet_data, chain):
                 update_time=get_utc8_time(),
                 last_transaction_time=wallet_data.get("last_transaction_time", int(datetime.now(timezone.utc).timestamp()))
             )
-
+            wallet_summary = WalletSummary(...)
             session.add(wallet_summary)
             print(f"Successfully added wallet: {wallet_data['wallet_address']}")
-        await session.commit()  # 提交所有更改
         return True
     except Exception as e:
-        await session.rollback()
         print(f"Error saving wallet: {wallet_data['wallet_address']} - {str(e)}")
         return False
     
