@@ -2,13 +2,13 @@ import aiohttp
 import backoff
 import asyncio
 from decimal import Decimal
-from main import log_execution_time
 from typing import Dict, List
 from aiohttp import ClientTimeout
 from contextlib import asynccontextmanager
+from config import RPC_URL
 
 # JSON-RPC 配置
-BSC_RPC_URL = "https://summer-necessary-diagram.bsc.quiknode.pro/f5a6381fc4834f55d98e9cdef8df8b16b63587bd"
+# BSC_RPC_URL = "https://frosty-wild-knowledge.bsc.quiknode.pro/9a7d28ef93c08d9afdfd5fbb1cc51d6998deed04"
 
 MAX_RETRIES = 3
 RETRY_DELAY = 2
@@ -90,7 +90,7 @@ async def get_token_balance(address, token_contract):
     for attempt in range(MAX_RETRIES):
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(BSC_RPC_URL, json=payload) as response:
+                async with session.post(RPC_URL, json=payload) as response:
                     if response.status == 429:
                         await asyncio.sleep(RETRY_DELAY * (attempt + 1))
                         continue
@@ -109,20 +109,21 @@ async def fetch_wallet_balances(wallets: List[str], bnb_price: Decimal) -> Dict[
     results = {}
     failed_wallets = []
     
-    async with RPCClient(BSC_RPC_URL) as rpc_client:
+    async with RPCClient(RPC_URL) as rpc_client:
         async def process_wallet(wallet: str):
             try:
                 bnb_balance = await rpc_client.get_bnb_balance(wallet)
+                
                 return wallet, {
                     "balance": bnb_balance,
-                    "balance_USD": bnb_balance * bnb_price
+                    "balance_usd": bnb_balance * bnb_price
                 }
             except Exception as e:
                 print(f"Failed to process wallet {wallet}: {str(e)}")
                 failed_wallets.append(wallet)
                 return wallet, {
                     "balance": Decimal(0),
-                    "balance_USD": Decimal(0)
+                    "balance_usd": Decimal(0)
                 }
 
         # 使用 gather 並行處理所有錢包

@@ -26,7 +26,7 @@ def format_decimal(dec):
 async def fetch_and_format_trades():
     async with async_session() as session:
         async with session.begin():
-            await session.execute(text("SET search_path TO bsc_dex;"))
+            await session.execute(text("SET search_path TO dex_query;"))
             
             result = await session.execute(text("""
                 SELECT 

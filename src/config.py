@@ -12,5 +12,9 @@ DATABASE_URI_SWAP_BSC = os.getenv('DATABASE_URI_SWAP_BSC')
 DATABASE_URI = os.getenv('DATABASE_URI')
 # DATABASE_URI_SWAP_TRON = os.getenv('DATABASE_URI_SWAP_TRON')
 
-RPC_URL = os.getenv('RPC_URL', "https://solana-mainnet.rpc.url")
+# BSC RPC URL
+RPC_URL = os.getenv('RPC_URL', "https://frosty-wild-knowledge.bsc.quiknode.pro/9a7d28ef93c08d9afdfd5fbb1cc51d6998deed04")
 HELIUS_API_KEY = "16e9dd4d-4cf7-4c69-8c2d-fafa13b03423"
+
+KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
+KAFKA_TOPIC = os.getenv('KAFKA_TOPIC', 'trade_events')

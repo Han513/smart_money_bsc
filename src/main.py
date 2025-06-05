@@ -1,526 +1,350 @@
-import asyncio
-import time
-import json
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from datetime import datetime, timedelta, timezone
+from quart import Quart, jsonify, request
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.sql import text
-from functools import wraps
-from decimal import Decimal
-from balance import *
-from models import *
-from config import *
-from sqlalchemy import text
-from typing import List, Dict
-from token_info import *
+from sqlalchemy import select
+import logging
+import asyncio
+import signal
+import sys
+import uuid
+import time
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional, Union
+from dataclasses import dataclass
+from functools import lru_cache
+import redis.asyncio as aioredis
+import json
 
-def log_execution_time(func):
-    @wraps(func)
-    async def wrapper(*args, **kwargs):
-        start_time = time.time()
-        result = await func(*args, **kwargs)  # 适用于异步函数
-        end_time = time.time()
-        execution_time = end_time - start_time
-        print(f"Function '{func.__name__}' executed in {execution_time:.4f} seconds.")
-        return result
-    return wrapper
+from models import WalletSummary
+from database import get_main_session_factory, get_swap_session_factory, get_main_engine, SessionLocal
+from config import DATABASE_URI, DATABASE_URI_SWAP_BSC
+from models import *  # 假設這裡是你的模型引用
+from daily_update_smart_money import WalletAnalyzer
+from transaction_sync import process_wallet_batch
 
-def get_update_time():
-    # 获取当前时间
-    now_utc = datetime.now(timezone.utc)
-    # 转换为 UTC+8
-    utc_plus_8 = now_utc + timedelta(hours=8)
-    # 格式化时间为字符串，格式可根据需要调整
-    return utc_plus_8.strftime("%Y-%m-%d %H:%M:%S")
+# 假設的異步函數來創建時間
+def get_utc8_time():
+    return datetime.utcnow()  # 根據你的需求可以使用 UTC+8
 
-def make_naive_time(dt):
-    """将带时区的时间转换为无时区时间"""
-    if isinstance(dt, datetime) and dt.tzinfo is not None:
-        return dt.replace(tzinfo=None)
-    return dt
+# 初始化 Quart 應用
+app = Quart(__name__)
 
-async def calculate_wallet_stats(data, bnb_price):
-    wallet_stats = {}
+# 設定日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
-    for row in data:
-        wallet = row['signer']
-        token_in = row['token_in']
-        token_out = row['token_out']
-        amount_in = Decimal(row['amount_in']) / (10 ** row['decimals_in'])
-        amount_out = Decimal(row['amount_out']) / (10 ** row['decimals_out'])
-        price_usd = Decimal(row['price_usd'])
-        timestamp = int(row['created_at'])
+# 設置數據庫連接
+DATABASE_URI_SWAP_BSC = DATABASE_URI_SWAP_BSC
+engine = create_async_engine(
+    DATABASE_URI_SWAP_BSC,
+    isolation_level="REPEATABLE READ",
+    pool_pre_ping=True,
+    pool_recycle=3600,
+    pool_size=10,
+    max_overflow=20
+)
 
-        if token_in in ('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', 
-                        '0x55d398326f99059fF775485246999027B3197955', 
-                        '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d'):
-            value = amount_in * (bnb_price if token_in == '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c' else Decimal(1))
-            action = 'buy'
-        else:
-            value = amount_out * (bnb_price if token_out == '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c' else Decimal(1))
-            action = 'sell'
+# 主要數據庫引擎
+main_engine = create_async_engine(
+    DATABASE_URI,
+    isolation_level="REPEATABLE READ",
+    pool_pre_ping=True,
+    pool_recycle=3600,
+    pool_size=10,
+    max_overflow=20
+)
 
-        if wallet not in wallet_stats:
-            wallet_stats[wallet] = {
-                'buy': [],
-                'sell': [],
-                'pnl': Decimal(0),
-                'last_transaction': None,
-                'tokens': set(),
-                'remaining_tokens': {},  # 用於統計剩餘代幣
-            }
+SessionLocal = sessionmaker(
+    engine, 
+    class_=AsyncSession, 
+    expire_on_commit=False,
+    autocommit=False,  # 明确设置为 False
+    autoflush=False   # 禁用自动刷新
+)
 
-        # 更新剩餘代幣的數量和價值
-        token = token_out if action == 'buy' else token_in
-        if action == 'buy':
-            # 確保 token 有正確初始化
-            wallet_stats[wallet]['remaining_tokens'].setdefault(token, {
-                'amount': Decimal(0), 'cost': Decimal(0), 'profit': Decimal(0)
-            })
-            wallet_stats[wallet]['remaining_tokens'][token]['amount'] += amount_in
-            wallet_stats[wallet]['remaining_tokens'][token]['cost'] += value
+# 初始化 scheduler
+scheduler = AsyncIOScheduler()
 
-        elif action == 'sell':
-            if token in wallet_stats[wallet]['remaining_tokens']:
-                wallet_stats[wallet]['remaining_tokens'][token]['amount'] -= amount_out
-                wallet_stats[wallet]['remaining_tokens'][token]['profit'] += value
+# 建立 Redis 連線（可根據實際情況調整 host/port/db）
+redis_client = aioredis.from_url("redis://localhost:6379/0", decode_responses=True)
 
-        # 更新其他字段
-        wallet_stats[wallet][action].append({'token': token, 'value': value, 'timestamp': timestamp})
-        wallet_stats[wallet]['tokens'].add(token)
-        wallet_stats[wallet]['last_transaction'] = (
-            timestamp if wallet_stats[wallet]['last_transaction'] is None
-            else max(wallet_stats[wallet]['last_transaction'], timestamp)
-        )
+async def set_task_status(request_id: str, status: dict, expire_seconds: int = 3600):
+    await redis_client.set(f"task_status:{request_id}", json.dumps(status), ex=expire_seconds)
 
-        # 計算 PNL
-        if action == 'sell':
-            wallet_stats[wallet]['pnl'] += value
-        else:
-            wallet_stats[wallet]['pnl'] -= value
+async def get_task_status(request_id: str):
+    data = await redis_client.get(f"task_status:{request_id}")
+    if data:
+        return json.loads(data)
+    return None
 
-    # 清理剩餘代幣中數量為 0 的代幣
-    for wallet, stats in wallet_stats.items():
-        stats['remaining_tokens'] = {
-            token: data
-            for token, data in stats['remaining_tokens'].items()
-            if data['amount'] > 0
+def signal_handler(sig, frame):
+    print("接收到終止信號，正在關閉應用...")
+    # 停止調度器
+    scheduler.shutdown(wait=False)
+    # 關閉所有連接池
+    engine.dispose()
+    main_engine.dispose()  # 使用正確的變量名稱
+    sys.exit(0)
+
+# 心跳接口，用於檢查服務是否正常運行
+@app.route('/heartbeat', methods=['GET'])
+async def heartbeat():
+    """
+    檢查服務是否運行，返回服務狀態。
+    """
+    try:
+        return jsonify({"status": "OK", "message": "服務正常運行", "timestamp": get_utc8_time().isoformat()}), 200
+    except Exception as e:
+        logging.error(f"心跳檢查失敗: {e}")
+        return jsonify({"status": "ERROR", "message": f"服務檢查失敗: {str(e)}"}), 500
+
+# 設置定期的心跳檢查任務（例如每分鐘檢查一次）
+@scheduler.scheduled_job('interval', minutes=1)
+async def scheduled_heartbeat_check():
+    try:
+        # 使用 test_client 來發送心跳請求
+        async with app.test_client() as client:
+            response = await client.get('/heartbeat')
+            if response.status_code != 200:
+                logging.warning("心跳檢查失敗！")
+    except Exception as e:
+        logging.error(f"定期心跳檢查失敗: {e}")
+
+# 數據模型
+@dataclass
+class WalletAnalysisRequest:
+    chain: str
+    type: str
+    addresses: List[str]
+    twitter_name: Optional[str] = None
+    twitter_username: Optional[str] = None
+
+@dataclass
+class WalletBatchResponse:
+    request_id: str
+    ready_results: Dict
+    pending_addresses: List[str]
+
+# 異步處理錢包分析
+async def process_wallet_analysis(request_id: str, addresses: List[str], chain: str, 
+                                twitter_names: Optional[List[Union[str, None]]] = None, 
+                                twitter_usernames: Optional[List[Union[str, None]]] = None):
+    try:
+        status = {
+            "status": "processing",
+            "start_time": int(time.time()),
+            "addresses": addresses,
+            "processed": 0,
+            "total": len(addresses)
         }
+        await set_task_status(request_id, status)
 
-    return wallet_stats
+        batch_size = 10
+        for i in range(0, len(addresses), batch_size):
+            batch = addresses[i:i + batch_size]
+            batch_twitter_names = twitter_names[i:i + batch_size] if twitter_names else [None] * len(batch)
+            batch_twitter_usernames = twitter_usernames[i:i + batch_size] if twitter_usernames else [None] * len(batch)
+            try:
+                results = await process_wallet_batch(
+                    batch,
+                    get_main_session_factory(),
+                    get_swap_session_factory(),
+                    get_main_engine(),
+                    logging.getLogger(__name__),
+                    batch_twitter_names,
+                    batch_twitter_usernames
+                )
+                status["processed"] += len(batch)
+                status["results"] = results
+                await set_task_status(request_id, status)
+            except Exception as e:
+                logging.error(f"處理批次時發生錯誤: {str(e)}")
+                status.setdefault("errors", []).append(str(e))
+                await set_task_status(request_id, status)
+        status["status"] = "completed"
+        status["end_time"] = int(time.time())
+        await set_task_status(request_id, status)
+    except Exception as e:
+        logging.error(f"處理錢包分析時發生錯誤: {str(e)}")
+        status = {"status": "failed", "error": str(e)}
+        await set_task_status(request_id, status)
 
-# @log_execution_time
-async def analyze_wallets_data(wallet_stats, bnb_price):
-    wallet_analysis = {}
-    current_time = int(time.time() * 1000)  # 当前时间戳（毫秒）
+# Webhook 更新接口
+@app.route('/robots/smartmoney/webhook/update-addresses/BSC', methods=['POST'])
+async def update_addresses():
+    """
+    異步處理錢包地址更新和分析，twitter_name、twitter_username 支援 list
+    """
+    try:
+        data = await request.json
+        chain = data.get("chain")
+        type = data.get("type")
+        addresses = data.get("addresses", [])
+        twitter_names = data.get("twitter_name", [])
+        twitter_usernames = data.get("twitter_username", [])
 
-    async def process_wallet(wallet, stats):
-        total_buy = sum(tx['value'] for tx in stats['buy'])
-        total_sell = sum(tx['value'] for tx in stats['sell'])
-        pnl = stats['pnl']
-        num_buy = len(stats['buy'])
-        num_sell = len(stats['sell'])
-        total_transactions = num_buy + num_sell
+        if not addresses:
+            return jsonify({"code": 400, "message": "請提供有效的地址列表"}), 400
 
-        # 盈利代币数量和胜率
-        profitable_tokens = len([tx for tx in stats['sell'] if tx['value'] > total_buy / (num_buy or 1)])
-        total_tokens = len(stats['tokens'])
-        win_rate = (profitable_tokens / total_tokens) * 100 if total_tokens > 0 else 0
-
-        # 时间范围
-        one_day_ago = current_time - 24 * 60 * 60 * 1000
-        seven_days_ago = current_time - 7 * 24 * 60 * 60 * 1000
-        thirty_days_ago = current_time - 30 * 24 * 60 * 60 * 1000
-
-        # 计算函数
-        def calculate_metrics(buy, sell, start_time):
-            buy_filtered = [tx for tx in buy if tx['timestamp'] >= start_time]
-            sell_filtered = [tx for tx in sell if tx['timestamp'] >= start_time]
-            total_buy_value = sum(tx['value'] for tx in buy_filtered)
-            total_sell_value = sum(tx['value'] for tx in sell_filtered)
-            num_buy = len(buy_filtered)
-            num_sell = len(sell_filtered)
-            pnl_value = total_sell_value - total_buy_value
-            pnl_percentage = (pnl_value / total_buy_value * 100) if total_buy_value > 0 else 0
-            avg_cost = total_buy_value / (num_buy or 1)
-            avg_realized_profit = pnl_value / (num_sell or 1)
-            total_transaction_num = num_buy + num_sell
-
-            return {
-                "win_rate": win_rate,
-                "total_cost": total_buy_value,
-                "avg_cost": avg_cost,
-                "total_transaction_num": total_transaction_num,
-                "buy_num": num_buy,
-                "sell_num": num_sell,
-                "pnl": pnl_value,
-                "pnl_percentage": pnl_percentage,
-                "avg_realized_profit": avg_realized_profit,
-                "unrealized_profit": 0
-            }
-
-        # 按时间范围计算
-        metrics_1d = calculate_metrics(stats['buy'], stats['sell'], one_day_ago)
-        metrics_7d = calculate_metrics(stats['buy'], stats['sell'], seven_days_ago)
-        metrics_30d = calculate_metrics(stats['buy'], stats['sell'], thirty_days_ago)
-        # metrics_30d['total_tokens'] = total_tokens
-
-        # 计算 asset_multiple
-        asset_multiple = metrics_30d['pnl_percentage'] / 100 if metrics_30d['pnl_percentage'] != 0 else 0
+        # 生成請求ID
+        request_id = str(uuid.uuid4())
         
-        # 计算最后活跃的前三个代币
-        all_tokens = stats['buy'] + stats['sell']
-        sorted_tokens = sorted(all_tokens, key=lambda tx: tx['timestamp'], reverse=True)
-        token_list = ",".join(
-            list(dict.fromkeys(tx['token'] for tx in sorted_tokens))[:3]
-        )
+        # 驗證鏈類型
+        valid_chains = ["BSC"]
+        if chain not in valid_chains:
+            return jsonify({
+                "code": 400,
+                "message": f"不支持的區塊鏈類型。支持的類型為: {', '.join(valid_chains)}"
+            }), 400
 
-        # 计算 pnl_pic
-        def calculate_daily_pnl(buy, sell, days, start_days_ago=None):
-            """
-            计算每日 PNL 数据。
-            参数:
-                buy: 买入交易记录
-                sell: 卖出交易记录
-                days: 总天数
-                start_days_ago: 从多少天前开始计算（可选）
-            """
-            daily_pnl = []
-            start_days_ago = start_days_ago or days  # 默认为整个时间范围
-            for day in range(start_days_ago):
-                start_time = current_time - (day + 1) * 24 * 60 * 60 * 1000
-                end_time = current_time - day * 24 * 60 * 60 * 1000
-                daily_buy = sum(tx['value'] for tx in buy if start_time <= tx['timestamp'] < end_time)
-                daily_sell = sum(tx['value'] for tx in sell if start_time <= tx['timestamp'] < end_time)
-                daily_pnl.append(daily_sell - daily_buy)
-            return ",".join(map(str, daily_pnl[::-1]))  # 按从过去到现在排列
+        # 驗證操作類型
+        valid_types = ["add", "remove"]
+        if type not in valid_types:
+            return jsonify({
+                "code": 400,
+                "message": f"不支持的操作類型。支持的類型為: {', '.join(valid_types)}"
+            }), 400
 
-        pnl_pic_1d = calculate_daily_pnl(stats['buy'], stats['sell'], 1)
-        pnl_pic_7d = calculate_daily_pnl(stats['buy'], stats['sell'], 7)
-        pnl_pic_30d = calculate_daily_pnl(stats['buy'], stats['sell'], 30)
+        # 限制地址數量
+        max_addresses = 300
+        if len(addresses) > max_addresses:
+            return jsonify({
+                "code": 400,
+                "message": f"地址數量超過限制。最大允許 {max_addresses} 個地址，請求包含 {len(addresses)} 個地址"
+            }), 400
 
-        # 计算分布和分布百分比
-        def calculate_distribution(sell, start_time):
-            sell_filtered = [tx for tx in sell if tx['timestamp'] >= start_time]
-            distribution = {"lt50": 0, "0to50": 0, "0to200": 0, "200to500": 0, "gt500": 0}
-            
-            # 避免 total_buy 为零的情况
-            total_buy_dec = Decimal(total_buy) if total_buy != 0 else Decimal(1)  # 使用 1 作为默认值，防止零除
+        # 移除重複地址
+        unique_addresses = list(dict.fromkeys(addresses))
+        if len(unique_addresses) < len(addresses):
+            logging.info(f"已移除 {len(addresses) - len(unique_addresses)} 個重複地址")
+            # 也要同步移除 twitter 對應資訊
+            if isinstance(twitter_names, list) and isinstance(twitter_usernames, list):
+                idx_map = [addresses.index(addr) for addr in unique_addresses]
+                twitter_names = [twitter_names[i] if i < len(twitter_names) else None for i in idx_map]
+                twitter_usernames = [twitter_usernames[i] if i < len(twitter_usernames) else None for i in idx_map]
 
-            for tx in sell_filtered:
-                if num_buy > 0:  # 检查 num_buy 是否为有效值
-                    pnl_percentage = ((tx['value'] - total_buy_dec) / total_buy_dec) * Decimal(100)
-                else:
-                    pnl_percentage = Decimal(0)  # 如果 num_buy 为 0，则直接设置 pnl_percentage 为 0
+        async with SessionLocal() as session:
+            if type == "add":
+                # await add_wallets_to_db(chain, session, unique_addresses)
+                asyncio.create_task(process_wallet_analysis(
+                    request_id,
+                    unique_addresses,
+                    chain,
+                    twitter_names,
+                    twitter_usernames
+                ))
+                return jsonify({
+                    "code": 200,
+                    "message": "地址添加成功，開始分析",
+                    "request_id": request_id,
+                    "pending_addresses": unique_addresses
+                }), 200
+            elif type == "remove":
+                await remove_wallets_from_db(chain, session, unique_addresses)
+                return jsonify({
+                    "code": 200,
+                    "message": "地址刪除成功！"
+                }), 200
+    except Exception as e:
+        logging.error(f"更新地址失敗: {str(e)}")
+        return jsonify({"code": 500, "message": f"更新地址失敗: {str(e)}"}), 500
 
-                if pnl_percentage < Decimal(-50):
-                    distribution["lt50"] += 1
-                elif Decimal(-50) <= pnl_percentage < Decimal(0):
-                    distribution["0to50"] += 1
-                elif Decimal(0) <= pnl_percentage <= Decimal(200):
-                    distribution["0to200"] += 1
-                elif Decimal(200) < pnl_percentage <= Decimal(500):
-                    distribution["200to500"] += 1
-                else:
-                    distribution["gt500"] += 1
-
-            return distribution
-
-        def calculate_distribution_percentage(distribution, total_tokens):
-            total_distribution = sum(distribution.values())
-            return {key: (value / total_distribution * 100 if total_distribution > 0 else 0) for key, value in distribution.items()}
-
-        distribution_7d = calculate_distribution(stats['sell'], seven_days_ago)
-        distribution_30d = calculate_distribution(stats['sell'], thirty_days_ago)
-        distribution_percentage_7d = calculate_distribution_percentage(distribution_7d, total_tokens)
-        distribution_percentage_30d = calculate_distribution_percentage(distribution_30d, total_tokens)
-
-        # 获取钱包余额
-        balances = await fetch_wallet_balances([wallet], bnb_price)
-
-        remaining_tokens = stats['remaining_tokens']
-        fetcher = TokenInfoFetcher()
-
-        # 查詢代幣即時信息
-        with ThreadPoolExecutor() as executor:
-            token_info_results = {
-                token: executor.submit(fetcher.get_token_info, token) for token in remaining_tokens
-            }
-        tx_data_list = []
-        for token, data in remaining_tokens.items():
-            # 獲取查詢結果
-            token_info = token_info_results[token].result()
-            
-            amount = data.get("amount", Decimal(0))
-            profit = data.get("profit", Decimal(0))
-            cost = data.get("cost", Decimal(0))
-
-            # 計算最後一筆交易時間
-            last_transaction_time = max(
-                tx['timestamp'] for tx in (stats['buy'] + stats['sell']) if tx['token'] == token
-            )
-
-            # 計算買入均價
-            buy_transactions = [
-                {
-                    'amount': remaining_tokens[token]['amount'],
-                    'cost': remaining_tokens[token]['cost']
-                } 
-                for token in remaining_tokens
-            ]
-
-            total_buy_value = sum(tx['cost'] for tx in buy_transactions)
-            total_buy_amount = sum(tx['amount'] for tx in buy_transactions if tx['amount'] > 0)
-            avg_price = total_buy_value / total_buy_amount if total_buy_amount > 0 else 0
-            token_info_price_native = Decimal(str(token_info.get("priceNative", 0)))
-            token_info_price_usd = Decimal(str(token_info.get("priceUsd", 0)))
-
-            # 統計結果
-            remaining_tokens_summary = {
-                "token_address": token,
-                "token_name": token_info.get("symbol", "Unknown"),
-                "token_icon": token_info.get("url", "no url"),
-                "chain": "BSC",
-                "amount": amount,
-                "value": amount  * token_info_price_native,  # 以最新價格計算價值
-                "value_USDT": amount  * token_info_price_usd,  # 以最新價格計算價值
-                "unrealized_profits": amount  * token_info_price_usd,  # 以最新價格計算價值
-                "pnl": profit - data["cost"],
-                "pnl_percentage": (profit - data["cost"]) / data["cost"] * 100 if data["cost"] > 0 else 0,
-                "marketcap": token_info.get("marketcap", 0),
-                "is_cleared": 0,
-                "cumulative_cost": data["cost"],
-                "cumulative_profit": profit,
-                "last_transaction_time": last_transaction_time,  # 最後一筆交易時間
-                "time": make_naive_time(datetime.now()),
-                "avg_price": avg_price,  # 該錢包在該代幣上的買入均價
-            }
-            tx_data_list.append(remaining_tokens_summary)
-
-        return wallet, {
-            'balance': balances[wallet]['balance'],
-            'balance_USD': balances[wallet]['balance_USD'],
-            'chain': "BSC",
-            'tag': None,
-            'twitter_name': None,
-            'twitter_username': None,
-            'is_smart_wallet': True,
-            'wallet_type': 0,
-            'asset_multiple': asset_multiple,
-            'token_list': token_list,
-            'total_tokens': total_tokens,
-            # 'total_buy': total_buy,
-            # 'total_sell': total_sell,
-            # 'pnl': pnl,
-            # 'win_rate': win_rate,
-            'total_transactions': total_transactions,            
-            'stats_1d': metrics_1d,
-            'stats_7d': metrics_7d,
-            'stats_30d': metrics_30d,
-            'pnl_pic_1d': pnl_pic_1d,
-            'pnl_pic_7d': pnl_pic_7d,
-            'pnl_pic_30d': pnl_pic_30d,
-            'distribution_7d': distribution_7d,
-            'distribution_30d': distribution_30d,
-            'distribution_percentage_7d': distribution_percentage_7d,
-            'distribution_percentage_30d': distribution_percentage_30d,
-            'update_time': get_update_time(),
-            'last_transaction': stats['last_transaction'],
-            'is_active': True,
-            'remaining_tokens': tx_data_list,
-        }
-
-    tasks = [process_wallet(wallet, stats) for wallet, stats in wallet_stats.items()]
-    results = await asyncio.gather(*tasks)
-
-    wallet_analysis = {wallet: analysis for wallet, analysis in results}
-    return wallet_analysis
-
-async def process_and_save_wallets(filtered_wallet_analysis, session, chain):
+# 添加查詢任務狀態的端點
+@app.route('/robots/smartmoney/webhook/task-status/<request_id>', methods=['GET'])
+async def get_task_status_endpoint(request_id: str):
     """
-    Process filtered_wallet_analysis data and save to database
+    查詢任務處理狀態
     """
-    for wallet_address, wallet_data in filtered_wallet_analysis.items():
-        wallet_data['wallet_address'] = wallet_address
-        tx_data_list = wallet_data['remaining_tokens']
-        try:
-            await write_wallet_data_to_db(session, wallet_data, chain)
-            await save_holding(tx_data_list, wallet_address, session, chain)
+    status = await get_task_status(request_id)
+    if not status:
+        return jsonify({"code": 404, "message": "找不到指定的任務"}), 404
+    return jsonify({"code": 200, "data": status}), 200
+
+class WalletMonitor:
+    def __init__(self):
+        self.is_processing = False
+        self.analyzer = WalletAnalyzer(DATABASE_URI, DATABASE_URI_SWAP_BSC)  # 從 daily_update_smart_money.py 導入
+        self.batch_size = 100  # 每批處理的錢包數量
+        
+    async def start_monitoring(self, addresses: List[str], chain: str, session: AsyncSession):
+        """
+        開始監控新加入的錢包地址
+        """
+        try:            
+            # 如果沒有其他分析進程在運行，才啟動新的分析進程
+            if not self.is_processing:
+                self.is_processing = True
+                await self._start_analysis_loop(chain, session)
         except Exception as e:
-            print(f"Failed to save wallet: {wallet_address} - {str(e)}")
+            logging.error(f"啟動錢包監控時發生錯誤: {str(e)}")
+            raise
 
-# 性能優化配置
-class PerformanceConfig:
-    MAX_CONCURRENT_TASKS = 20  # 並發任務數
-    CHUNK_SIZE = 1000  # 批次處理數量
-    LOGGING_INTERVAL = 100  # 日誌記錄間隔
-
-class WalletAnalyzer:
-    def __init__(self, database_uri, swap_database_uri):
-        # 創建連接池
-        self.engine = create_async_engine(
-            database_uri, 
-            pool_size=20,
-            max_overflow=10,
-            pool_timeout=30,
-            pool_recycle=1800,
-            echo=False
-        )
-        self.swap_engine = create_async_engine(
-            swap_database_uri,
-            pool_size=20,
-            max_overflow=10,
-            pool_timeout=30,
-            pool_recycle=1800,
-            echo=False
-        )
-        
-        self.async_session = sessionmaker(
-            bind=self.engine, 
-            class_=AsyncSession, 
-            expire_on_commit=False
-        )
-        self.swap_async_session = sessionmaker(
-            bind=self.swap_engine, 
-            class_=AsyncSession, 
-            expire_on_commit=False
-        )
-        
-        # 設置日誌
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s: %(message)s'
-        )
-        self.logger = logging.getLogger(__name__)
-
-    async def get_unique_wallets(self, session) -> List[str]:
-        """獲取所有唯一錢包地址"""
-        query = """
-        SELECT DISTINCT signer 
-        FROM bsc_dex.trades 
-        WHERE (
-            token_in IN ('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', 
-                        '0x55d398326f99059fF775485246999027B3197955', 
-                        '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d')
-            OR 
-            token_out IN ('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', 
-                         '0x55d398326f99059fF775485246999027B3197955', 
-                         '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d')
-        )
+    async def _start_analysis_loop(self, chain: str, session: AsyncSession):
         """
-        result = await session.execute(text(query))
-        return [row[0] for row in result]
-
-    async def process_wallet(self, wallet: str, bnb_price: Decimal) -> Dict:
-        """處理單個錢包"""
-        async with self.async_session() as session:
-            async with session.begin():
-                await session.execute(text("SET search_path TO bsc_dex;"))
-                wallet_trades = await self.get_wallet_trades(session, wallet)
-        
-        if not wallet_trades:
-            return None
-
-        async with self.async_session() as session:
-            async with session.begin():
-                wallet_stats = await calculate_wallet_stats(wallet_trades, bnb_price)
-                wallet_analysis = await analyze_wallets_data(wallet_stats, bnb_price)
-
-        return wallet_analysis
-
-    # async def save_wallet_data(self, wallet_analysis: Dict):
-    #     """保存錢包分析結果"""
-    #     async with self.swap_async_session() as db_session:
-    #         async with db_session.begin():
-    #             filtered_wallet_analysis = {
-    #                 wallet: data for wallet, data in wallet_analysis.items()
-    #                 if data['total_tokens'] >= 5 and data['stats_30d']['win_rate'] > 40
-    #             }
-                
-    #             if filtered_wallet_analysis:
-    #                 await process_and_save_wallets(
-    #                     filtered_wallet_analysis, 
-    #                     db_session, 
-    #                     chain="BSC"
-    #                 )
-
-    async def analyze_wallets(self, bnb_price: Decimal):
-        """主分析流程"""
-        start_time = time.time()
-        
-        # 獲取唯一錢包
-        async with self.async_session() as session:
-            async with session.begin():
-                unique_wallets = await self.get_unique_wallets(session)
-        
-        total_wallets = len(unique_wallets)
-        self.logger.info(f"開始分析 {total_wallets} 個錢包")
-
-        # 創建信號量控制並發
-        semaphore = asyncio.Semaphore(PerformanceConfig.MAX_CONCURRENT_TASKS)
-        processed_wallets = 0
-
-        async def process_wallet_with_semaphore(wallet):
-            nonlocal processed_wallets
-            async with semaphore:
-                try:
-                    wallet_analysis = await self.process_wallet(wallet, bnb_price)
-                    if wallet_analysis:
-                        # 為每個錢包創建新的會話
-                        async with self.swap_async_session() as db_session:
-                            async with db_session.begin():
-                                filtered_wallet_analysis = {
-                                    wallet: data for wallet, data in wallet_analysis.items()
-                                    if data['total_tokens'] >= 5 and data['stats_30d']['win_rate'] > 40
-                                }
-                                
-                                if filtered_wallet_analysis:
-                                    await process_and_save_wallets(
-                                        filtered_wallet_analysis, 
-                                        db_session, 
-                                        chain="BSC"
-                                    )
+        開始週期性分析循環
+        """
+        try:
+            while True:
+                # 獲取要分析的活躍錢包
+                addresses = await get_active_wallets(chain, session)
                     
-                    processed_wallets += 1
-                    if processed_wallets % PerformanceConfig.LOGGING_INTERVAL == 0:
-                        self.logger.info(f"已處理 {processed_wallets}/{total_wallets} 個錢包")
+                if not addresses:
+                    # logging.info("暫時沒有需要分析的錢包")
+                    await asyncio.sleep(60)
+                    continue
+
+                try:
+                    # 使用 WalletAnalyzer 的 process_wallet_batch 方法處理錢包
+                    results = await self.analyzer.process_wallet_batch(addresses, 700)
                 except Exception as e:
-                    self.logger.error(f"錢包 {wallet} 處理失敗: {str(e)}")
+                    logging.error(f"處理錢包批次時發生錯誤: {str(e)}")
 
-        # 分批處理錢包
-        for i in range(0, total_wallets, PerformanceConfig.CHUNK_SIZE):
-            chunk = unique_wallets[i:i + PerformanceConfig.CHUNK_SIZE]
-            tasks = [process_wallet_with_semaphore(wallet) for wallet in chunk]
-            await asyncio.gather(*tasks)
+                # 等待1分鐘後再處理下一批
+                await asyncio.sleep(60)
+        except Exception as e:
+            logging.error(f"分析循環中發生錯誤: {str(e)}")
+            self.is_processing = False
+            raise
+        finally:
+            self.is_processing = False
 
-        end_time = time.time()
-        self.logger.info(f"總處理時間: {end_time - start_time:.2f} 秒")
+wallet_monitor = WalletMonitor()
 
-    async def get_wallet_trades(self, session, wallet_address):
-        """獲取特定錢包的所有交易紀錄"""
-        query = """
-        SELECT * 
-        FROM bsc_dex.trades 
-        WHERE signer = :wallet_address
-        AND (
-            token_in IN ('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', 
-                        '0x55d398326f99059fF775485246999027B3197955', 
-                        '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d')
-            OR 
-            token_out IN ('0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', 
-                         '0x55d398326f99059fF775485246999027B3197955', 
-                         '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d')
-        )
-        ORDER BY created_at ASC
-        """
-        result = await session.execute(text(query), {'wallet_address': wallet_address})
-        return result.mappings().all()
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
-async def main():
-    bnb_price = await get_price()
+async def immediate_sync():
+    """立即執行同步任務"""
+    from transaction_sync import sync_new_transactions
+    try:
+        logging.info("立即執行同步任務開始...")
+        await sync_new_transactions(SessionLocal, SessionLocal, engine)
+        logging.info("立即執行同步任務完成")
+    except Exception as e:
+        logging.error(f"立即執行同步任務出錯: {e}")
 
-    analyzer = WalletAnalyzer(DATABASE_URI, DATABASE_URI_SWAP_BSC)
-    await analyzer.analyze_wallets(bnb_price)
+@app.before_serving
+async def startup():
+    """
+    在 Quart 启动时启动 APScheduler 和其他任务。
+    """
+    # 原有代碼
+    scheduler.start()  # 啟動 scheduler
+    # app.add_background_task(run_wallet_monitor)
+    
+    # 新增：設置交易同步任務，傳遞引擎實例
+    # setup_sync_task(scheduler, SessionLocal, SessionLocal, engine)
+    logging.info("交易同步任務已設置")
+    
+    # 立即執行一次同步任務
+    # app.add_background_task(immediate_sync)
+
+async def run_wallet_monitor():
+    async with SessionLocal() as session:
+        await wallet_monitor._start_analysis_loop("BSC", session)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    app.run(debug=False, host='0.0.0.0', port=5000, startup_timeout=60)
