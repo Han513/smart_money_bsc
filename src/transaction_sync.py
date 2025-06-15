@@ -24,6 +24,7 @@ from aiokafka import AIOKafkaConsumer
 from config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, RPC_URL
 from sqlalchemy.dialects.postgresql import insert
 from collections import defaultdict
+from token_cache import token_cache  # 导入 Redis 缓存实例
 
 logger = logging.getLogger(__name__)
 now_utc_plus_8 = datetime.utcnow() + timedelta(hours=8)
@@ -38,69 +39,72 @@ class KafkaConsumer:
         self.swap_session_factory = swap_session_factory
         self.main_engine = main_engine
         self.consumer = None
-        self.is_running = False
         self.wallet_address_set = set()
-        self.refresh_wallet_address_task = None
-        logger.info("KafkaConsumer initialized")
+        self.running = True
+        self.session = None  # 初始化 session 属性为 None
 
     async def refresh_wallet_address_set(self):
-        while True:
-            try:
-                async with self.swap_session_factory() as session:
-                    async with session.begin():
-                        addresses = await session.execute(
-                            select(WalletSummary.wallet_address).where(WalletSummary.chain == 'BSC')
-                        )
-                        self.wallet_address_set = set(addresses.scalars().all())
-                        logger.info(f"[CACHE] 已刷新 wallet_address_set, 共 {len(self.wallet_address_set)} 筆")
-            except Exception as e:
-                logger.error(f"刷新 wallet_address_set 發生錯誤: {str(e)}")
-            await asyncio.sleep(1800)
+        """刷新钱包地址集合"""
+        try:
+            async with self.swap_session_factory() as session:
+                addresses = await get_active_wallets("BSC", session)
+                self.wallet_address_set = set(addresses)
+                logger.info(f"[CACHE] 已刷新 wallet_address_set, 共 {len(self.wallet_address_set)} 筆")
+        except Exception as e:
+            logger.error(f"刷新钱包地址集合时出错: {str(e)}")
 
     async def start(self):
-        """啟動 Kafka 消費者"""
+        """启动 Kafka 消费者"""
         try:
             logger.info("Starting Kafka consumer...")
+            
+            # 创建数据库会话
+            self.session = self.swap_session_factory()
+            
+            # 初始化消费者
             self.consumer = AIOKafkaConsumer(
-                KAFKA_TOPIC,
+                'web3_trade_sm_events',
                 bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
                 group_id='smart_money_group',
                 auto_offset_reset='latest',
                 enable_auto_commit=True,
                 value_deserializer=lambda m: json.loads(m.decode('utf-8'))
             )
-            
+
             logger.info(f"Connecting to Kafka brokers: {KAFKA_BOOTSTRAP_SERVERS}")
             await self.consumer.start()
-            self.is_running = True
-            logger.info(f"Kafka consumer started successfully, listening to topic: {KAFKA_TOPIC}")
-            
-            # 啟動快取刷新任務
-            self.refresh_wallet_address_task = asyncio.create_task(self.refresh_wallet_address_set())
-            
+            logger.info("Kafka consumer started successfully, listening to topic: web3_trade_sm_events")
+
+            # 刷新钱包地址集合
+            await self.refresh_wallet_address_set()
+
+            logger.info("Starting to consume messages...")
             try:
-                logger.info("Starting to consume messages...")
-                async for message in self.consumer:
-                    # logger.info(f"Received message: {message.topic} - Partition: {message.partition} - Offset: {message.offset}")
-                    await self.process_message(message.value)
-            except Exception as e:
-                logger.error(f"Error processing Kafka message: {str(e)}")
-                logger.error(traceback.format_exc())
+                async for msg in self.consumer:
+                    if not self.running:
+                        break
+                    try:
+                        await self.process_message(msg.value)
+                    except Exception as e:
+                        logger.error(f"处理消息时出错: {str(e)}")
             finally:
                 await self.stop()
-                
+
         except Exception as e:
-            logger.error(f"Error starting Kafka consumer: {str(e)}")
-            logger.error(traceback.format_exc())
-            self.is_running = False
+            logger.error(f"Kafka consumer error: {str(e)}")
+            if self.consumer:
+                await self.consumer.stop()
+            if self.session:
+                await self.session.close()
 
     async def stop(self):
-        """停止 Kafka 消費者"""
+        """停止 Kafka 消费者"""
+        self.running = False
         if self.consumer:
-            logger.info("Stopping Kafka consumer...")
             await self.consumer.stop()
-            self.is_running = False
-            logger.info("Kafka consumer stopped")
+        if self.session:
+            await self.session.close()
+            self.session = None
 
     async def process_message(self, message: Dict):
         """處理 Kafka 消息"""
@@ -116,191 +120,124 @@ class KafkaConsumer:
             tx_hash = event.get('hash')
             wallet_address = event.get('address')
             token_address = event.get('tokenAddress')
-            amount = Decimal('0')
+            
+            # 计算 amount
+            if event.get('side', '').lower() == 'buy':
+                amount = Decimal(str(event.get('toTokenAmount', '0')))
+            else:
+                amount = Decimal(str(event.get('fromTokenAmount', '0')))
+                
             value_usd = Decimal(str(event.get('volumeUsd', '0')))
             timestamp = int(event.get('timestamp', 0))
             side = event.get('side', '').lower()
-            base_mint = event.get('baseMint')
-            quote_mint = event.get('quoteMint')
 
-            token_info = await TokenInfoFetcher.get_token_info(token_address.lower())
-
-            if side == 'buy':
-                from_token_address = quote_mint
-                dest_token_address = base_mint
-                from_token_amount = event.get('fromTokenAmount', 0)
-                dest_token_amount = event.get('toTokenAmount', 0)
-                amount = Decimal(str(from_token_amount))
-            else:
-                from_token_address = base_mint
-                dest_token_address = quote_mint
-                from_token_amount = event.get('fromTokenAmount', 0)
-                dest_token_amount = event.get('toTokenAmount', 0)
-                amount = Decimal(str(from_token_amount))
-
-            from_token_info = await TokenInfoFetcher.get_token_info(from_token_address.lower())
-            dest_token_info = await TokenInfoFetcher.get_token_info(dest_token_address.lower())
-
-            if not all([tx_hash, wallet_address, token_address, from_token_address, dest_token_address]):
-                logger.warning("Missing required fields in event")
-                return
-
-            # 只查快取 set
+            # 只处理在 wallet_address_set 中的钱包
             if wallet_address not in self.wallet_address_set:
-                # logger.info(f"wallet_address {wallet_address} 不在快取名單，跳過交易寫入")
                 return
 
-            bnb_price = await get_price()
-            supply = Decimal('0')
-            if token_info and token_info.get('supply') is not None and token_info.get('decimals') is not None:
-                supply = Decimal(str(token_info['supply'])) / Decimal(str(10 ** token_info['decimals']))
-            price_usd = float(value_usd / amount)
+            # 获取代币信息
+            token_info = await TokenInfoFetcher.get_token_info(token_address)
+            if not token_info:
+                return
 
-            marketcap = Decimal(str(price_usd)) * Decimal(str(supply))
+            # 获取当前持仓数据
+            token_data = token_cache.get_token_data(wallet_address, token_address)
+            current_holding = token_data['total_amount']
 
-            async with self.swap_session_factory() as session:
-                async with session.begin():
-                    await session.execute(text("SET search_path TO dex_query_v1;"))
+            # 更新缓存中的数据
+            token_data = token_cache.update_token_data(
+                wallet_address,
+                token_address,
+                side,
+                amount,
+                value_usd,
+                timestamp
+            )
 
-                    default_token_data = {
-                        "token_address": token_address,
-                        "avg_buy_price": Decimal('0'),
-                        "total_amount": Decimal('0'),
-                        "total_cost": Decimal('0'),
-                        "historical_total_buy_amount": Decimal('0'),
-                        "historical_total_buy_cost": Decimal('0'),
-                        "historical_avg_buy_price": Decimal('0'),
-                        "last_transaction_time": 0,
-                        "total_buy_count": 0,
-                        "total_sell_count": 0
-                    }
-                    # 取得所有 token 的持倉資料
-                    db_token_buy_data_dict = await get_wallet_token_buy_data(wallet_address, session)
-                    # 用 memory dict 暫存本 session 內最新狀態
-                    local_token_buy_data_dict = {k: {**default_token_data, **v} for k, v in db_token_buy_data_dict.items()}
+            # 确定交易类型
+            transaction_type = token_cache.determine_transaction_type(side, amount, current_holding)
 
-                    # 只處理一筆交易（本函數每次只處理一筆 message）
-                    # 取得本 token 的最新狀態
-                    token_data = local_token_buy_data_dict.get(token_address, default_token_data.copy())
+            # 获取钱包余额
+            try:
+                wallet_balance = await get_wallet_balance(wallet_address)
+            except Exception as e:
+                logger.warning(f"获取钱包余额失败: {str(e)}")
+                wallet_balance = Decimal('0')
 
-                    balance_bnb = await get_wallet_balance(wallet_address)
-                    balance_usd = balance_bnb * bnb_price
+            # 准备交易数据
+            # 根据交易方向设置 from_token 和 dest_token
+            if side == 'buy':
+                from_token_address = event.get('quoteMint', '')
+                dest_token_address = event.get('baseMint', '')
+                from_token_symbol = event.get('quoteSymbol', '')
+                dest_token_symbol = event.get('baseSymbol', '')
+                from_token_amount = event.get('fromTokenAmount', 0)
+                dest_token_amount = event.get('toTokenAmount', 0)
+            else:  # sell
+                from_token_address = event.get('baseMint', '')
+                dest_token_address = event.get('quoteMint', '')
+                from_token_symbol = event.get('baseSymbol', '')
+                dest_token_symbol = event.get('quoteSymbol', '')
+                from_token_amount = event.get('fromTokenAmount', 0)
+                dest_token_amount = event.get('toTokenAmount', 0)
 
-                    holding_percentage = Decimal('100')
-                    if side == 'buy':
-                        if balance_usd > Decimal('0'):
-                            holding_percentage = min((value_usd / (value_usd + balance_usd)) * Decimal('100'), Decimal('100'))
-                    else:
-                        if token_data["total_amount"] > Decimal('0'):
-                            holding_percentage = min((amount / (amount + token_data["total_amount"])) * Decimal('100'), Decimal('100'))
+            tx_data = {
+                "wallet_address": wallet_address,
+                "wallet_balance": float(wallet_balance),
+                "token_address": token_address,
+                "token_icon": token_info.get('token_icon', ''),
+                "token_name": token_info.get('token_name', ''),
+                "price": float(value_usd / amount) if amount > 0 else 0,
+                "amount": float(amount),
+                "marketcap": token_info.get('marketcap', 0),
+                "value": float(value_usd),
+                "chain": "BSC",
+                "chain_id": 9006,
+                "realized_profit": float(token_data['realized_profit']),
+                "realized_profit_percentage": float(token_data['realized_profit_percentage']),
+                "transaction_type": transaction_type,
+                "transaction_time": timestamp,
+                "time": get_utc8_time(),
+                "from_token_address": from_token_address,
+                "dest_token_address": dest_token_address,
+                "from_token_symbol": from_token_symbol,
+                "dest_token_symbol": dest_token_symbol,
+                "from_token_amount": float(from_token_amount) if from_token_amount else 0.0,
+                "dest_token_amount": float(dest_token_amount) if dest_token_amount else 0.0,
+                "signature": tx_hash
+            }
 
-                    realized_profit = Decimal('0')
-                    realized_profit_percentage = Decimal('0')
-
-                    if side == 'sell':
-                        sell_price = value_usd / amount if amount > Decimal('0') else Decimal('0')
-                        realized_profit = value_usd - (amount * token_data['avg_buy_price'])
-                        if token_data['avg_buy_price'] > Decimal('0'):
-                            realized_profit_percentage = ((sell_price / token_data['avg_buy_price']) - Decimal('1')) * Decimal('100')
-
-                    transaction = {
-                        "wallet_address": wallet_address,
-                        "wallet_balance": float(balance_usd + value_usd),
-                        "signature": tx_hash,
-                        "chain": "BSC",
-                        # "chain_id": 9006,
-                        "token_address": token_address,
-                        "token_icon": token_info.get('uri', None),
-                        "token_name": token_info.get('symbol', None),
-                        "price": price_usd if amount > 0 else 0,
-                        "marketcap": marketcap,
-                        "holding_percentage": float(holding_percentage),
-                        "amount": float(amount),
-                        "value": float(value_usd),
-                        "chain": "BSC",
-                        "transaction_type": side,
-                        "transaction_time": timestamp,
-                        "time": datetime.now(),
-                        "realized_profit": float(realized_profit),
-                        "realized_profit_percentage": float(realized_profit_percentage),
-                        "from_token_address": from_token_address,
-                        "from_token_amount": float(from_token_amount),
-                        "from_token_symbol": from_token_info.get('symbol', None),
-                        "dest_token_address": dest_token_address,
-                        "dest_token_amount": float(dest_token_amount),
-                        "dest_token_symbol": dest_token_info.get('symbol', None)
-                    }
-                    # 先判斷 wallet_address 是否存在於 wallet_summary 表
-                    wallet_exists = await session.execute(
-                        select(WalletSummary).filter(WalletSummary.wallet_address == wallet_address)
+            # 保存交易记录
+            max_retries = 3
+            retry_count = 0
+            while retry_count < max_retries:
+                try:
+                    success = await save_past_transaction(
+                        self.session,
+                        tx_data,
+                        wallet_address,
+                        tx_hash,
+                        "BSC",
+                        auto_commit=True
                     )
-                    if not wallet_exists.scalars().first():
-                        logger.info(f"wallet_address {wallet_address} 不在 wallet_summary 表中，跳過交易寫入")
-                        return  # 不寫入交易紀錄
+                    if success:
+                        break
+                except Exception as e:
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        logger.error(f"保存交易记录失败，已重试 {max_retries} 次: {str(e)}")
+                        raise
+                    logger.warning(f"保存交易记录失败，正在重试 ({retry_count}/{max_retries}): {str(e)}")
+                    await asyncio.sleep(0.5)  # 等待500ms后重试
 
-                    # 有的話才寫入
-                    try:
-                        await save_past_transaction(
-                            session,
-                            transaction,
-                            wallet_address,
-                            tx_hash,
-                            "BSC",
-                            auto_commit=False
-                        )
-                    except Exception as e:
-                        logger.error(f"[ERROR] save_past_transaction 發生異常: {str(e)} (wallet_address={wallet_address}, token_address={token_address}, transaction={transaction})")
+            # 检查是否需要刷新缓存到数据库
+            await token_cache.maybe_flush_to_db(self.session)
 
-                    def process_buy(token_data, amount, value_usd):
-                        total_buy_count = token_data.get('total_buy_count', 0) + 1
-                        new_total_amount = token_data['total_amount'] + amount
-                        new_total_cost = token_data['total_cost'] + value_usd
-                        new_avg_buy_price = new_total_cost / new_total_amount if new_total_amount > 0 else Decimal('0')
-                        return {**token_data, "avg_buy_price": new_avg_buy_price, "total_amount": new_total_amount, "total_cost": new_total_cost, "total_buy_count": total_buy_count}
-
-                    def process_sell(token_data, amount, value_usd):
-                        total_sell_count = token_data.get('total_sell_count', 0) + 1
-                        new_total_amount = max(Decimal('0'), token_data['total_amount'] - amount)
-                        if new_total_amount == 0:
-                            historical_total_buy_amount = token_data['total_amount']
-                            historical_total_buy_cost = token_data['total_cost']
-                            historical_avg_buy_price = token_data['total_cost'] / token_data['total_amount'] if token_data['total_amount'] > 0 else Decimal('0')
-                            new_avg_buy_price = Decimal('0')
-                            new_total_cost = Decimal('0')
-                        else:
-                            historical_total_buy_amount = token_data.get('historical_total_buy_amount', Decimal('0'))
-                            historical_total_buy_cost = token_data.get('historical_total_buy_cost', Decimal('0'))
-                            historical_avg_buy_price = token_data.get('historical_avg_buy_price', Decimal('0'))
-                            new_avg_buy_price = token_data['avg_buy_price']
-                            new_total_cost = token_data['total_cost'] * (new_total_amount / token_data['total_amount']) if token_data['total_amount'] > 0 else Decimal('0')
-                        return {**token_data, "avg_buy_price": new_avg_buy_price, "total_amount": new_total_amount, "total_cost": new_total_cost, "historical_total_buy_amount": historical_total_buy_amount, "historical_total_buy_cost": historical_total_buy_cost, "historical_avg_buy_price": historical_avg_buy_price, "total_sell_count": total_sell_count}
-
-                    # 主流程簡化，直接用 memory dict
-                    if side == 'buy':
-                        token_buy_data = process_buy(token_data, amount, value_usd)
-                    else:
-                        token_buy_data = process_sell(token_data, amount, value_usd)
-                    token_buy_data['last_transaction_time'] = timestamp
-
-                    # 更新 memory dict
-                    local_token_buy_data_dict[token_address] = token_buy_data
-
-                    try:
-                        result = await save_wallet_buy_data(
-                            wallet_address,
-                            token_buy_data,
-                            token_address,
-                            session,
-                            "BSC",
-                            auto_commit=False
-                        )
-                        # logger.info(f"[DEBUG] save_wallet_buy_data 寫入結果: {result} (wallet_address={wallet_address}, token_address={token_address})")
-                    except Exception as e:
-                        logger.error(f"[ERROR] save_wallet_buy_data 發生異常: {str(e)} (wallet_address={wallet_address}, token_address={token_address}, token_buy_data={token_buy_data})")
+            return True
 
         except Exception as e:
-            logger.error(f"Error processing message: {str(e)}")
-            logger.error(traceback.format_exc())
+            logger.error(f"处理消息时出错: {str(e)}")
+            return False
 
 async def with_timeout(coro, timeout=60, description="操作"):
     try:
@@ -523,42 +460,30 @@ async def get_existing_signatures(session, wallet_addresses):
     return signatures
 
 async def get_wallet_trades_batch(session, wallet_addresses: List[str]):
-    """批量獲取多個錢包的交易記錄"""
+    """批量獲取多個錢包的交易記錄（逐個查詢，並加強debug日誌，並將地址轉為checksum格式）"""
     await session.execute(text("SET search_path TO dex_query_v1;"))
-    query = text("""
-        SELECT * 
-        FROM dex_query_v1.trades
-        WHERE chain_id = 9006
-        AND dex ILIKE '%pancake%'
-        AND signer = ANY(:wallet_addresses)
-        AND (
-            token_in IN (
-                '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
-                '0x55d398326f99059fF775485246999027B3197955',
-                '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d'
-            )
-            OR 
-            token_out IN (
-                '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
-                '0x55d398326f99059fF775485246999027B3197955',
-                '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d'
-            )
-        )
-        ORDER BY timestamp ASC
-    """)
-
-    # 正確的參數綁定方式
-    result = await session.execute(query, {"wallet_addresses": wallet_addresses})
-    trades = result.mappings().all()
-    
-    # 將結果按錢包地址分組
+    # 1. 查詢 search_path
+    result = await session.execute(text("SHOW search_path"))
+    print("[DEBUG] Current search_path:", result.fetchall())
+    # 2. 查詢 trades 表前5筆
+    result = await session.execute(text("SELECT * FROM dex_query_v1.trades LIMIT 5"))
+    print("[DEBUG] Sample trades:", result.mappings().all())
     trades_by_wallet = {}
-    for trade in trades:
-        wallet = trade['signer']
-        if wallet not in trades_by_wallet:
-            trades_by_wallet[wallet] = []
-        trades_by_wallet[wallet].append(trade)
-            
+    for wallet in wallet_addresses:
+        try:
+            checksum_wallet = to_checksum_address(wallet)
+        except Exception:
+            checksum_wallet = wallet  # fallback, 若非EVM格式
+        print(f"[DEBUG] Querying trades for wallet: {wallet} (checksum: {checksum_wallet})")
+        # 3. 查詢指定錢包的trades前5筆
+        result = await session.execute(text("SELECT * FROM dex_query_v1.trades WHERE chain_id = 9006 AND signer = :wallet_address LIMIT 5"), {"wallet_address": checksum_wallet})
+        print(f"[DEBUG] Sample trades for {wallet}:", result.mappings().all())
+        # 4. 查詢所有交易
+        result = await session.execute(text("SELECT * FROM dex_query_v1.trades WHERE chain_id = 9006 AND signer = :wallet_address ORDER BY timestamp ASC"), {"wallet_address": checksum_wallet})
+        trades = result.mappings().all()
+        print(f"[DEBUG] Got {len(trades)} trades for {wallet}")
+        if trades:
+            trades_by_wallet[wallet] = trades
     return trades_by_wallet
 
 async def get_wallet_token_buy_data(wallet_address, session):
@@ -578,7 +503,16 @@ async def get_wallet_token_buy_data(wallet_address, session):
                 "token_address": data.token_address,
                 "avg_buy_price": Decimal(str(data.avg_buy_price)) if data.avg_buy_price else Decimal('0'),
                 "total_amount": Decimal(str(data.total_amount)) if data.total_amount else Decimal('0'),
-                "total_cost": Decimal(str(data.total_cost)) if data.total_cost else Decimal('0')
+                "total_cost": Decimal(str(data.total_cost)) if data.total_cost else Decimal('0'),
+                "historical_total_buy_amount": Decimal(str(data.historical_total_buy_amount)) if data.historical_total_buy_amount else Decimal('0'),
+                "historical_total_buy_cost": Decimal(str(data.historical_total_buy_cost)) if data.historical_total_buy_cost else Decimal('0'),
+                "historical_avg_buy_price": Decimal(str(data.historical_avg_buy_price)) if data.historical_avg_buy_price else Decimal('0'),
+                "historical_total_sell_amount": Decimal(str(data.historical_total_sell_amount)) if data.historical_total_sell_amount else Decimal('0'),
+                "historical_total_sell_value": Decimal(str(data.historical_total_sell_value)) if data.historical_total_sell_value else Decimal('0'),
+                "historical_avg_sell_price": Decimal(str(data.historical_avg_sell_price)) if data.historical_avg_sell_price else Decimal('0'),
+                "total_buy_count": data.total_buy_count if data.total_buy_count else 0,
+                "total_sell_count": data.total_sell_count if data.total_sell_count else 0,
+                "last_transaction_time": data.last_transaction_time if data.last_transaction_time else 0
             }
         
         return token_buy_data_dict
@@ -588,169 +522,83 @@ async def get_wallet_token_buy_data(wallet_address, session):
         return {}
 
 async def process_trades_and_update_wallets(wallet, trades, session, bnb_price, main_engine, logger, balance_usd):
-    """
-    逐筆處理交易，wallet_transaction 每筆都寫入，wallet_buy_data 最後以 date 聚合寫入。
-    """
-    from collections import defaultdict
-    from decimal import Decimal
-    from datetime import datetime
-    # 0. 收集所有 token_address
-    token_addresses = set()
-    for trade in trades:
-        token_addresses.add(trade['token_in'].lower())
-        token_addresses.add(trade['token_out'].lower())
-    # 1. 批量獲取 token info
-    token_info_dict = await fetch_token_info_for_wallets(token_addresses)
-    # 2. 批量寫入 redis
-    for addr, info in token_info_dict.items():
-        try:
-            await redis_client.set(f"token_info:{addr}", json.dumps(info), ex=3600)
-        except Exception:
-            pass
-    # 1. 查詢該錢包所有 token 的持倉
-    token_buy_data_dict = await get_wallet_token_buy_data(wallet, session)
-    # 2. 交易依時間排序
-    sorted_trades = sorted(trades, key=lambda x: int(x['timestamp'] / 1000))
-    # 3. 準備每日聚合 dict
-    daily_agg = defaultdict(lambda: defaultdict(list))  # {token_address: {date: [trade, ...]}}
-    for trade in sorted_trades:
-        token_in = trade['token_in']
-        token_out = trade['token_out']
-        ts = int(trade['timestamp'] / 1000)
-        dt = datetime.utcfromtimestamp(ts)
-        date = dt.date()
-        # 判斷主 token
-        if token_in in (
-            '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
-            '0x55d398326f99059fF775485246999027B3197955',
-            '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d'):
-            token_address = token_out
-            action = 'buy'
-            amount = Decimal(str(trade['amount_out'])) / Decimal(str(10 ** trade['decimals_out']))
-            value = Decimal(str(trade['amount_in'])) / Decimal(str(10 ** trade['decimals_in']))
-            if token_in == '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c':
-                value = value * Decimal(str(bnb_price))
-        else:
-            token_address = token_in
-            action = 'sell'
-            amount = Decimal(str(trade['amount_in'])) / Decimal(str(10 ** trade['decimals_in']))
-            value = Decimal(str(trade['amount_out'])) / Decimal(str(10 ** trade['decimals_out']))
-            if token_out == '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c':
-                value = value * Decimal(str(bnb_price))
-        # 依 token+date 分組
-        daily_agg[token_address.lower()][date].append(trade)
-        # 取得目前持倉
-        token_data = token_buy_data_dict.get(token_address, {
-            "token_address": token_address,
-            "avg_buy_price": Decimal('0'),
-            "total_amount": Decimal('0'),
-            "total_cost": Decimal('0')
-        })
-        # 更新持倉
-        if action == 'buy':
-            total_amount = token_data['total_amount'] + amount
-            total_cost = token_data['total_cost'] + value
-            avg_buy_price = total_cost / total_amount if total_amount > 0 else Decimal('0')
-            token_data.update({
-                'total_amount': total_amount,
-                'total_cost': total_cost,
-                'avg_buy_price': avg_buy_price
-            })
-        else:
-            total_amount = max(Decimal('0'), token_data['total_amount'] - amount)
-            total_cost = token_data['total_cost'] * (total_amount / token_data['total_amount']) if token_data['total_amount'] > 0 else Decimal('0')
-            avg_buy_price = token_data['avg_buy_price']
-            token_data.update({
-                'total_amount': total_amount,
-                'total_cost': total_cost,
-                'avg_buy_price': avg_buy_price
-            })
-        token_buy_data_dict[token_address] = token_data
-        # 組裝 transaction dict
-        realized_profit = 0
-        realized_profit_percentage = 0
-        if action == 'sell' and amount > 0:
-            avg_buy_price = token_data['avg_buy_price']
-            sell_price = value / amount if amount > 0 else 0
-            realized_profit = float(value - amount * avg_buy_price)
-            realized_profit_percentage = float(((sell_price - avg_buy_price) / avg_buy_price) * 100) if avg_buy_price > 0 else 0
-        # 取得 token info
-        token_info = token_info_dict.get(token_address.lower(), {})
-        token_name = token_info.get('symbol', None)
-        token_icon = token_info.get('uri', None)
-        price = float(trade.get('price_usd', 0))
-        supply = 0
-        decimals = 18
-        try:
-            supply_raw = token_info.get('supply', 0) or 0
-            decimals = int(token_info.get('decimals', 18) or 18)
-            supply = float(supply_raw) / float(10 ** decimals) if supply_raw else 0
-        except Exception:
-            supply = 0
-            decimals = 18
-        marketcap = price * supply if price and supply else 0
-        transaction = {
-            "wallet_address": wallet,
-            "wallet_balance": float(balance_usd),
-            "signature": trade['tx_hash'],
-            "token_address": token_address,
-            "token_icon": token_icon,
-            "token_name": token_name,
-            "price": price,
-            "amount": float(amount),
-            "marketcap": marketcap,
-            "value": float(value),
-            "holding_percentage": 0,
-            "chain": "BSC",
-            # "chain_id": 9006,
-            "realized_profit": realized_profit,
-            "realized_profit_percentage": realized_profit_percentage,
-            "transaction_type": action,
-            "transaction_time": ts,
-            "time": datetime.now(),
-            "from_token_address": trade['token_in'],
-            "from_token_symbol": None,
-            "from_token_amount": float(trade['amount_in']) / float(10 ** trade['decimals_in']),
-            "dest_token_address": trade['token_out'],
-            "dest_token_symbol": None,
-            "dest_token_amount": float(trade['amount_out']) / float(10 ** trade['decimals_out'])
-        }
-        await save_past_transaction(session, transaction, wallet, trade['tx_hash'], 'BSC', auto_commit=False)
-    # 4. 每日聚合寫入 wallet_buy_data
-    for token_address, date_trades in daily_agg.items():
-        for date, trades in date_trades.items():
-            # 聚合這一天的所有交易，計算每日持倉/成本/買賣次數等
-            total_amount = Decimal('0')
-            total_cost = Decimal('0')
-            total_buy_count = 0
-            total_sell_count = 0
-            for trade in trades:
-                token_in = trade['token_in']
-                token_out = trade['token_out']
-                if token_in in (
-                    '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
-                    '0x55d398326f99059fF775485246999027B3197955',
-                    '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d'):
-                    total_amount += Decimal(str(trade['amount_out'])) / Decimal(str(10 ** trade['decimals_out']))
-                    total_cost += Decimal(str(trade['amount_in'])) / Decimal(str(10 ** trade['decimals_in']))
-                    total_buy_count += 1
-                else:
-                    total_amount -= Decimal(str(trade['amount_in'])) / Decimal(str(10 ** trade['decimals_in']))
-                    total_cost -= Decimal(str(trade['amount_out'])) / Decimal(str(10 ** trade['decimals_out']))
-                    total_sell_count += 1
-            avg_buy_price = total_cost / total_amount if total_amount > 0 else Decimal('0')
-            tx_data = {
-                "token_address": token_address,
-                "avg_buy_price": float(avg_buy_price),
-                "total_amount": float(total_amount),
-                "total_cost": float(total_cost),
-                "total_buy_count": total_buy_count,
-                "total_sell_count": total_sell_count,
-                "date": date
-            }
-            await save_wallet_buy_data(wallet, tx_data, token_address, session, "BSC", auto_commit=False)
-    print(f"已完成逐筆交易寫入 wallet_transaction 及每日聚合寫入 wallet_buy_data for {wallet}")
-    return True
+    """處理交易並更新錢包數據"""
+    try:
+        wallet_address = wallet.wallet_address
+        transactions_to_save = []
+
+        for trade in trades:
+            try:
+                # 獲取代幣信息
+                token_address = trade.token_address.lower()
+                
+                # 從緩存獲取代幣數據
+                token_data = token_buy_data_cache.get(wallet_address, token_address, trade.transaction_time.date())
+                
+                # 處理交易
+                action = trade.transaction_type
+                amount = Decimal(str(trade.amount))
+                value = Decimal(str(trade.value))
+                
+                if action == 'buy':
+                    token_data = _process_buy_token_data(token_data, amount, value)
+                elif action == 'sell':
+                    token_data = _process_sell_token_data(token_data, amount, value)
+                
+                # 更新最後交易時間
+                token_data['last_transaction_time'] = int(trade.transaction_time.timestamp())
+                
+                # 更新緩存
+                token_buy_data_cache.update(wallet_address, token_address, trade.transaction_time.date(), action, amount, value, int(trade.transaction_time.timestamp()))
+                
+                # 構建交易記錄
+                tx_data = {
+                    "wallet_address": wallet_address,
+                    "wallet_balance": 0.0,  # 添加默认值为0.0
+                    "token_address": token_address,
+                    "token_icon": token_info_results.get(token, {}).get('token_icon', ''),
+                    "token_name": token_info_results.get(token, {}).get('token_name', ''),
+                    "price": float(value / amount) if amount > 0 else 0,
+                    "amount": float(amount),
+                    "marketcap": token_info_results.get(token, {}).get('marketcap', 0),
+                    "value": float(value),
+                    "chain": "BSC",
+                    "chain_id": 9006,
+                    "realized_profit": float(token_data['realized_profit']),
+                    "realized_profit_percentage": float(token_data['realized_profit_percentage']),
+                    "transaction_type": action,
+                    "transaction_time": trade.transaction_time,
+                    "time": get_update_time(),
+                    "signature": trade.signature,
+                }
+                
+                # 获取钱包余额
+                try:
+                    wallet_balance = await get_wallet_balance(wallet_address)
+                    tx_data["wallet_balance"] = float(wallet_balance)
+                except Exception as e:
+                    logger.warning(f"获取钱包余额失败: {str(e)}")
+                    # 保持默认值 0.0
+                
+                # 添加到待保存列表
+                transactions_to_save.append(tx_data)
+                
+                # 每處理一定數量的交易就嘗試同步到資料庫
+                if len(transactions_to_save) >= 50:
+                    await token_buy_data_cache.maybe_flush(session)
+                
+            except Exception as e:
+                logger.error(f"處理交易時出錯: {str(e)}")
+                continue
+
+        # 最後一次同步到資料庫
+        await token_buy_data_cache.maybe_flush(session)
+        
+        return transactions_to_save
+
+    except Exception as e:
+        logger.error(f"處理錢包 {wallet_address} 的交易時出錯: {str(e)}")
+        return []
 
 async def analyze_wallets_data(wallet_stats, bnb_price):
     """
@@ -1054,7 +902,7 @@ async def analyze_wallets_data(wallet_stats, bnb_price):
             'is_active': True,
             'remaining_tokens': tx_data_list,
         }
-    print("INININININ")
+
     tasks = [process_wallet(wallet, stats) for wallet, stats in wallet_stats.items()]
     results = await asyncio.gather(*tasks)
 
@@ -1090,7 +938,7 @@ async def process_wallet_batch(wallet_addresses, main_session_factory, swap_sess
                     description="獲取錢包交易記錄"
                 )
                 total_trades = sum(len(trades) for trades in trades_by_wallet.values())
-                # logger.info(f"從 dex_query_v1.trades 獲取了 {total_trades} 筆交易記錄")
+                logger.info(f"從 dex_query_v1.trades 獲取了 {total_trades} 筆交易記錄")
             except Exception as e:
                 logger.error(f"獲取錢包交易記錄時發生錯誤: {str(e)}")
                 if "relation \"dex_query_v1.trades\" does not exist" in str(e):
@@ -1288,6 +1136,148 @@ async def get_wallet_balance(wallet_address: str) -> Decimal:
     except Exception as e:
         logger.error(f"獲取錢包 {wallet_address} 餘額時發生錯誤: {str(e)}")
         return Decimal('0')
+
+class TokenBuyDataCache:
+    def __init__(self):
+        # {wallet_address: {token_address: {date: token_data}}}
+        self._cache = {}
+        self._last_flush_time = time.time()
+        self._flush_interval = 300  # 5分鐘同步一次到資料庫
+        self._dirty = set()  # 記錄需要更新的 (wallet_address, token_address, date)
+
+    def get(self, wallet_address: str, token_address: str, date: datetime.date) -> dict:
+        """獲取指定日期的代幣數據，如果不存在則返回默認值"""
+        wallet_cache = self._cache.setdefault(wallet_address, {})
+        token_cache = wallet_cache.setdefault(token_address, {})
+        return token_cache.get(date, {
+            "token_address": token_address,
+            "date": date,
+            "total_amount": Decimal('0'),
+            "total_cost": Decimal('0'),
+            "avg_buy_price": Decimal('0'),
+            "position_opened_at": None,
+            "historical_total_buy_amount": Decimal('0'),
+            "historical_total_buy_cost": Decimal('0'),
+            "historical_total_sell_amount": Decimal('0'),
+            "historical_total_sell_value": Decimal('0'),
+            "historical_avg_buy_price": Decimal('0'),
+            "historical_avg_sell_price": Decimal('0'),
+            "last_transaction_time": None,
+            "realized_profit": Decimal('0'),
+            "realized_profit_percentage": Decimal('0'),
+            "total_buy_count": 0,
+            "total_sell_count": 0,
+            "total_holding_seconds": 0,
+            "updated_at": get_utc8_time()
+        })
+
+    def update(self, wallet_address: str, token_address: str, date: datetime.date, action: str, amount: Decimal, value: Decimal, transaction_time: int):
+        """更新緩存中的代幣數據"""
+        token_data = self.get(wallet_address, token_address, date)
+        current_time = transaction_time
+
+        if action == 'buy':
+            # 更新當前持倉數據
+            token_data['total_amount'] += amount
+            token_data['total_cost'] += value
+            token_data['avg_buy_price'] = token_data['total_cost'] / token_data['total_amount'] if token_data['total_amount'] > 0 else Decimal('0')
+            
+            # 更新歷史買入數據
+            token_data['historical_total_buy_amount'] += amount
+            token_data['historical_total_buy_cost'] += value
+            token_data['historical_avg_buy_price'] = (
+                token_data['historical_total_buy_cost'] / token_data['historical_total_buy_amount']
+                if token_data['historical_total_buy_amount'] > 0 else Decimal('0')
+            )
+            
+            # 更新買入次數
+            token_data['total_buy_count'] += 1
+            
+            # 更新開倉時間
+            if token_data['position_opened_at'] is None:
+                token_data['position_opened_at'] = current_time
+
+        elif action == 'sell':
+            # 計算賣出部分的成本和利潤
+            if token_data['total_amount'] > 0:
+                sell_ratio = min(amount / token_data['total_amount'], Decimal('1'))
+                cost_basis = token_data['total_cost'] * sell_ratio
+                profit = value - cost_basis
+                profit_percentage = ((value / cost_basis) - Decimal('1')) * Decimal('100') if cost_basis > 0 else Decimal('-100')
+                
+                # 更新當前持倉數據
+                token_data['total_amount'] -= amount
+                if token_data['total_amount'] <= 0:
+                    token_data['total_cost'] = Decimal('0')
+                    token_data['avg_buy_price'] = Decimal('0')
+                    token_data['position_opened_at'] = None
+                else:
+                    token_data['total_cost'] *= (1 - sell_ratio)
+                    token_data['avg_buy_price'] = token_data['total_cost'] / token_data['total_amount']
+            else:
+                # 超賣情況
+                token_data['total_amount'] -= amount
+                profit = Decimal('0')
+                profit_percentage = Decimal('-100')
+            
+            # 更新歷史賣出數據
+            token_data['historical_total_sell_amount'] += amount
+            token_data['historical_total_sell_value'] += value
+            token_data['historical_avg_sell_price'] = (
+                token_data['historical_total_sell_value'] / token_data['historical_total_sell_amount']
+                if token_data['historical_total_sell_amount'] > 0 else Decimal('0')
+            )
+            
+            # 更新已實現利潤
+            token_data['realized_profit'] += profit
+            token_data['realized_profit_percentage'] = max(profit_percentage, Decimal('-100'))
+            
+            # 更新賣出次數
+            token_data['total_sell_count'] += 1
+
+        # 更新最後交易時間
+        token_data['last_transaction_time'] = current_time
+        token_data['updated_at'] = get_utc8_time()
+
+        # 更新緩存
+        wallet_cache = self._cache.setdefault(wallet_address, {})
+        token_cache = wallet_cache.setdefault(token_address, {})
+        token_cache[date] = token_data
+        self._dirty.add((wallet_address, token_address, date))
+
+    async def maybe_flush(self, session):
+        """如果距離上次同步超過間隔時間，則同步到資料庫"""
+        current_time = time.time()
+        if current_time - self._last_flush_time >= self._flush_interval and self._dirty:
+            await self.flush(session)
+
+    async def flush(self, session):
+        """強制同步所有更改到資料庫"""
+        try:
+            for wallet_address, token_address, date in self._dirty:
+                token_data = self._cache[wallet_address][token_address][date]
+                await save_wallet_buy_data(
+                    wallet_address=wallet_address,
+                    token_address=token_address,
+                    tx_data={**token_data, "date": date},
+                    session=session,
+                    chain="BSC",
+                    auto_commit=True
+                )
+            self._dirty.clear()
+            self._last_flush_time = time.time()
+        except Exception as e:
+            print(f"Error flushing cache to database: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def clear(self):
+        """清空緩存"""
+        self._cache.clear()
+        self._dirty.clear()
+
+# 創建全局緩存實例
+token_buy_data_cache = TokenBuyDataCache()
 
 if __name__ == "__main__":
     from config import DATABASE_URI, DATABASE_URI_SWAP_BSC

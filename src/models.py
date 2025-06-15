@@ -18,14 +18,16 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from sqlalchemy.dialects.postgresql import insert
 
 load_dotenv()
+
+# 設置日誌
+logger = logging.getLogger(__name__)
+logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+
 # 初始化資料庫
 Base = declarative_base()
 DATABASES = {
     "BSC": DATABASE_URI_SWAP_BSC
 }
-
-logger = logging.getLogger(__name__)
-logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 
 # 为每条链初始化 engine 和 sessionmaker
 engines = {
@@ -426,6 +428,11 @@ async def write_wallet_data_to_db(session, wallet_data, chain, twitter_name: Opt
             existing_wallet.last_transaction_time = wallet_data.get("last_transaction_time", int(datetime.now(timezone.utc).timestamp()))
             
             print(f"Successfully updated wallet: {wallet_data['wallet_address']}")
+            
+            # 將錢包資料轉換為 API 格式並推送到後端
+            api_data = wallet_to_api_dict(existing_wallet)
+            if api_data:
+                await push_wallet_to_api(api_data)
         else:
             # 如果不存在，就創建新記錄
             wallet_summary = WalletSummary(
@@ -500,6 +507,13 @@ async def write_wallet_data_to_db(session, wallet_data, chain, twitter_name: Opt
             )
             session.add(wallet_summary)
             print(f"Successfully added wallet: {wallet_data['wallet_address']}")
+            
+            # 將新增的錢包資料轉換為 API 格式並推送到後端
+            api_data = wallet_to_api_dict(wallet_summary)
+            print(f"api_data: {api_data}")
+            if api_data:
+                await push_wallet_to_api(api_data)
+                
         return True
     except Exception as e:
         # 安全地獲取 wallet_address (即使不存在也不會拋出錯誤)
@@ -697,6 +711,7 @@ def remove_emoji(text):
 async def save_wallet_buy_data(wallet_address, tx_data, token_address, session, chain, auto_commit=False):
     """
     保存钱包购买代币的数据，包括平均买入价格、总量和总成本，並確保 chain、chain_id、date 欄位正確。
+    只有当交易时间大于现有记录的 last_transaction_time 时才进行累加更新。
     """
     try:
         schema = 'dex_query_v1'
@@ -719,6 +734,9 @@ async def save_wallet_buy_data(wallet_address, tx_data, token_address, session, 
             ts = int(last_transaction_time.timestamp())
         else:
             ts = int(last_transaction_time)
+            if ts > 9999999999:  # 如果是毫秒時間戳
+                ts = ts // 1000  # 轉換為秒級時間戳
+        
         # 轉為 UTC+8 當天 00:00:00
         dt_utc8 = datetime.utcfromtimestamp(ts) + timedelta(hours=8)
         date = dt_utc8.date()  # 只取 date
@@ -737,33 +755,90 @@ async def save_wallet_buy_data(wallet_address, tx_data, token_address, session, 
         # -------------------------------------------------------------
 
         async def do_save():
+            # 设置 schema 搜索路径
+            await session.execute(text("SET search_path TO dex_query_v1;"))
+            
             # 查詢現有紀錄（wallet_address, token_address, chain, date 為唯一 key）
             check_query = text("""
-                SELECT id FROM dex_query_v1.wallet_buy_data 
+                SELECT id, last_transaction_time, historical_total_buy_amount, historical_total_buy_cost, 
+                       historical_total_sell_amount, historical_total_sell_value,
+                       total_amount, total_cost, avg_buy_price, total_buy_count, total_sell_count
+                FROM wallet_buy_data 
                 WHERE wallet_address = :wallet AND LOWER(token_address) = :token AND chain = :chain AND date = :date
             """)
             result = await session.execute(check_query, {"wallet": wallet_address, "token": token_address, "chain": chain, "date": date})
-            existing_id = result.scalar()
+            existing_record = result.fetchone()
 
-            avg_buy_price = float(tx_data.get("avg_buy_price", 0))
-            total_amount = float(tx_data.get("total_amount", 0))
-            total_cost = float(tx_data.get("total_cost", 0))
-            historical_total_buy_amount = float(tx_data.get("historical_total_buy_amount", 0))
-            historical_total_buy_cost = float(tx_data.get("historical_total_buy_cost", 0))
-            historical_avg_buy_price = float(tx_data.get("historical_avg_buy_price", 0))
-            total_buy_count = int(tx_data.get("total_buy_count", 0))
-            total_sell_count = int(tx_data.get("total_sell_count", 0))
-            last_transaction_time = ts
+            # 从传入数据中获取值
+            new_avg_buy_price = float(tx_data.get("avg_buy_price", 0))
+            new_total_amount = float(tx_data.get("total_amount", 0))
+            new_total_cost = float(tx_data.get("total_cost", 0))
+            new_historical_total_buy_amount = float(tx_data.get("historical_total_buy_amount", 0))
+            new_historical_total_buy_cost = float(tx_data.get("historical_total_buy_cost", 0))
+            new_historical_total_sell_amount = float(tx_data.get("historical_total_sell_amount", 0))
+            new_historical_total_sell_value = float(tx_data.get("historical_total_sell_value", 0))
+            new_total_buy_count = int(tx_data.get("total_buy_count", 0))
+            new_total_sell_count = int(tx_data.get("total_sell_count", 0))
+            
+            if existing_record:
+                existing_id = existing_record[0]
+                existing_last_transaction_time = existing_record[1] or 0
+                
+                # 关键逻辑：只有当新交易时间大于现有记录的 last_transaction_time 时才进行更新
+                if ts <= existing_last_transaction_time:
+                    print(f"[SKIP] 交易已处理过: wallet={wallet_address}, token={token_address}, "
+                          f"new_time={ts}, existing_time={existing_last_transaction_time}")
+                    return True  # 跳过已处理的交易
+                
+                # print(f"[UPDATE] 处理新交易: wallet={wallet_address}, token={token_address}, "
+                #       f"new_time={ts}, existing_time={existing_last_transaction_time}")
+                
+                # 累加历史数据（新交易的增量）
+                historical_total_buy_amount = float(existing_record[2] or 0) + new_historical_total_buy_amount
+                historical_total_buy_cost = float(existing_record[3] or 0) + new_historical_total_buy_cost
+                historical_total_sell_amount = float(existing_record[4] or 0) + new_historical_total_sell_amount
+                historical_total_sell_value = float(existing_record[5] or 0) + new_historical_total_sell_value
+                
+                # 当前持仓数据直接使用新值（因为这是最新的持仓状态）
+                total_amount = new_total_amount
+                total_cost = new_total_cost
+                avg_buy_price = new_avg_buy_price
+                
+                # 累加交易次数
+                total_buy_count = int(existing_record[9] or 0) + new_total_buy_count
+                total_sell_count = int(existing_record[10] or 0) + new_total_sell_count
+                
+            else:
+                existing_id = None
+                print(f"[INSERT] 新增记录: wallet={wallet_address}, token={token_address}, time={ts}")
+                
+                # 新记录直接使用传入的所有值
+                historical_total_buy_amount = new_historical_total_buy_amount
+                historical_total_buy_cost = new_historical_total_buy_cost
+                historical_total_sell_amount = new_historical_total_sell_amount
+                historical_total_sell_value = new_historical_total_sell_value
+                total_amount = new_total_amount
+                total_cost = new_total_cost
+                avg_buy_price = new_avg_buy_price
+                total_buy_count = new_total_buy_count
+                total_sell_count = new_total_sell_count
+            
+            # 计算历史平均价格
+            historical_avg_buy_price = historical_total_buy_cost / historical_total_buy_amount if historical_total_buy_amount > 0 else 0
+            historical_avg_sell_price = historical_total_sell_value / historical_total_sell_amount if historical_total_sell_amount > 0 else 0
 
             if existing_id:
                 update_query = text("""
-                    UPDATE dex_query_v1.wallet_buy_data 
+                    UPDATE wallet_buy_data 
                     SET avg_buy_price = :avg_price, 
                         total_amount = :amount, 
                         total_cost = :cost,
                         historical_total_buy_amount = :historical_total_buy_amount,
                         historical_total_buy_cost = :historical_total_buy_cost,
                         historical_avg_buy_price = :historical_avg_buy_price,
+                        historical_total_sell_amount = :historical_total_sell_amount,
+                        historical_total_sell_value = :historical_total_sell_value,
+                        historical_avg_sell_price = :historical_avg_sell_price,
                         last_active_position_closed_at = :last_active_position_closed_at,
                         last_transaction_time = :last_transaction_time,
                         total_buy_count = :total_buy_count,
@@ -778,8 +853,11 @@ async def save_wallet_buy_data(wallet_address, tx_data, token_address, session, 
                     "historical_total_buy_amount": historical_total_buy_amount,
                     "historical_total_buy_cost": historical_total_buy_cost,
                     "historical_avg_buy_price": historical_avg_buy_price,
+                    "historical_total_sell_amount": historical_total_sell_amount,
+                    "historical_total_sell_value": historical_total_sell_value,
+                    "historical_avg_sell_price": historical_avg_sell_price,
                     "last_active_position_closed_at": last_active_position_closed_at,
-                    "last_transaction_time": last_transaction_time,
+                    "last_transaction_time": ts,  # 更新为新的交易时间
                     "total_buy_count": total_buy_count,
                     "total_sell_count": total_sell_count,
                     "update_time": get_utc8_time(),
@@ -787,29 +865,51 @@ async def save_wallet_buy_data(wallet_address, tx_data, token_address, session, 
                 })
             else:
                 insert_query = text("""
-                    INSERT INTO dex_query_v1.wallet_buy_data 
-                        (wallet_address, token_address, chain, chain_id, date, avg_buy_price, total_amount, total_cost, updated_at, historical_total_buy_amount, historical_total_buy_cost, historical_avg_buy_price, last_active_position_closed_at, last_transaction_time, total_buy_count, total_sell_count)
+                    INSERT INTO wallet_buy_data 
+                        (wallet_address, token_address, chain, chain_id, date, avg_buy_price, total_amount, total_cost, updated_at, 
+                         historical_total_buy_amount, historical_total_buy_cost, historical_avg_buy_price, 
+                         historical_total_sell_amount, historical_total_sell_value, historical_avg_sell_price,
+                         last_active_position_closed_at, last_transaction_time, total_buy_count, total_sell_count)
                     VALUES 
-                        (:wallet, :token, :chain, :chain_id, :date, :avg_price, :amount, :cost, :update_time, :historical_total_buy_amount, :historical_total_buy_cost, :historical_avg_buy_price, :last_active_position_closed_at, :last_transaction_time, :total_buy_count, :total_sell_count)
+                        (:wallet, :token, :chain, :chain_id, :date, :avg_price, :amount, :cost, :update_time, 
+                         :historical_total_buy_amount, :historical_total_buy_cost, :historical_avg_buy_price,
+                         :historical_total_sell_amount, :historical_total_sell_value, :historical_avg_sell_price,
+                         :last_active_position_closed_at, :last_transaction_time, :total_buy_count, :total_sell_count)
+                    RETURNING id
                 """)
-                await session.execute(insert_query, {
-                    "wallet": wallet_address,
-                    "token": token_address,
-                    "chain": chain,
-                    "chain_id": chain_id,
-                    "date": date,
-                    "avg_price": avg_buy_price,
-                    "amount": total_amount,
-                    "cost": total_cost,
-                    "update_time": get_utc8_time(),
-                    "historical_total_buy_amount": historical_total_buy_amount,
-                    "historical_total_buy_cost": historical_total_buy_cost,
-                    "historical_avg_buy_price": historical_avg_buy_price,
-                    "last_active_position_closed_at": last_active_position_closed_at,
-                    "last_transaction_time": last_transaction_time,
-                    "total_buy_count": total_buy_count,
-                    "total_sell_count": total_sell_count
-                })
+                try:
+                    result = await session.execute(insert_query, {
+                        "wallet": wallet_address,
+                        "token": token_address,
+                        "chain": chain,
+                        "chain_id": chain_id,
+                        "date": date,
+                        "avg_price": avg_buy_price,
+                        "amount": total_amount,
+                        "cost": total_cost,
+                        "update_time": get_utc8_time(),
+                        "historical_total_buy_amount": historical_total_buy_amount,
+                        "historical_total_buy_cost": historical_total_buy_cost,
+                        "historical_avg_buy_price": historical_avg_buy_price,
+                        "historical_total_sell_amount": historical_total_sell_amount,
+                        "historical_total_sell_value": historical_total_sell_value,
+                        "historical_avg_sell_price": historical_avg_sell_price,
+                        "last_active_position_closed_at": last_active_position_closed_at,
+                        "last_transaction_time": ts,
+                        "total_buy_count": total_buy_count,
+                        "total_sell_count": total_sell_count
+                    })
+                    # 獲取新插入記錄的 ID，如果失敗則返回 False
+                    try:
+                        new_id = result.scalar_one()
+                        if not new_id:
+                            print(f"警告: 插入記錄成功但未返回 ID (wallet={wallet_address}, token={token_address})")
+                    except Exception as e:
+                        print(f"警告: 獲取插入記錄 ID 失敗 (wallet={wallet_address}, token={token_address}): {str(e)}")
+                        return False
+                except Exception as e:
+                    print(f"錯誤: 插入記錄失敗 (wallet={wallet_address}, token={token_address}): {str(e)}")
+                    return False
 
         # 決定是否需要自己開 transaction
         if session.in_transaction():
@@ -832,73 +932,75 @@ async def save_past_transaction(async_session, tx_data, wallet_address, signatur
     """
     保存或更新交易記錄到數據庫，使用 UPSERT（on conflict do update）
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    
     try:
-        schema = 'dex_query_v1'
-        await async_session.execute(text("SET search_path TO dex_query_v1;"))
-        Transaction.with_schema(schema)
-        WalletSummary.with_schema(schema)
-
-        # 處理 transaction_time，確保它落在正確的分區範圍內
-        transaction_time = tx_data.get("transaction_time")
-        print(f"\n[DEBUG] 處理交易: wallet={wallet_address}, token={tx_data.get('token_address')}, time={transaction_time}")
-
-        if transaction_time > 9999999999999:  # 如果是微秒時間戳
-            transaction_time = transaction_time // 1000  # 轉換為秒級時間戳
-            print(f"[DEBUG] 微秒轉秒: {transaction_time}")
-        elif transaction_time > 9999999999:  # 如果是毫秒時間戳
-            transaction_time = transaction_time // 1000  # 轉換為秒級時間戳
-            print(f"[DEBUG] 毫秒轉秒: {transaction_time}")
-        tx_data["transaction_time"] = transaction_time
-        tx_data["chain_id"] = 9006
-        tx_data["token_name"] = remove_emoji(tx_data.get('token_name', ''))
-        tx_data["transaction_time"] = make_naive_time(tx_data.get("transaction_time"))
-        tx_data["time"] = make_naive_time(tx_data.get("time", get_utc8_time()))
-
-        # print(f"[DEBUG] 準備插入數據: {tx_data}")
-        import logging
-        logger = logging.getLogger(__name__)
-        # logger.info(f"[TRANSACTION] 準備寫入 wallet_transaction: {tx_data.get('wallet_address')} {tx_data.get('token_address')} {tx_data.get('transaction_time')}")
-
-        # 檢查會話狀態
-        if not async_session.is_active:
-            print("[DEBUG] Session 不活躍，創建新 session")
-            async_session = AsyncSession(async_session.get_bind())
-
-        # 構建 upsert 語句
-        stmt = insert(Transaction).values(**tx_data).on_conflict_do_update(
-            index_elements=['signature', 'wallet_address', 'token_address', 'transaction_time'],
-            set_=tx_data
-        )
-
-        # print("[DEBUG] 執行 SQL 語句...")
-        try:
-            result = await async_session.execute(stmt)
-            # print(f"[DEBUG] SQL 執行成功: {result}")
-            logger.info(f"[TRANSACTION] 已寫入 wallet_transaction: {tx_data.get('wallet_address')} {tx_data.get('token_address')} {tx_data.get('transaction_time')}")
-            
-            # if auto_commit:
-            #     await async_session.commit()
-            #     print("[DEBUG] 自動提交完成")
-            # await async_session.commit()
-            # print("[DEBUG] 自動提交完成")
-            return True
-        except Exception as e:
-            print(f"[ERROR] SQL 執行失敗: {str(e)}")
-            print(f"[ERROR] 失敗的交易數據: {tx_data}")
-            if auto_commit:
+        # 如果会话已经在事务中且已中止，先回滚
+        if async_session.in_transaction():
+            try:
                 await async_session.rollback()
-                print("[DEBUG] 自動回滾完成")
-            # 直接拋出異常，不再繼續處理
-            raise
+                logger.info("已回滾之前失敗的事務")
+            except Exception as e:
+                logger.error(f"回滾事務失敗: {str(e)}")
+                # 如果回滚失败，创建新会话
+                async_session = AsyncSession(async_session.get_bind())
+        
+        # 开始新的事务
+        async with async_session.begin():
+            schema = 'dex_query_v1'
+            await async_session.execute(text("SET search_path TO dex_query_v1;"))
+            Transaction.with_schema(schema)
+            WalletSummary.with_schema(schema)
+            
+            tx_data.pop('id', None)
+            
+            # 確保 wallet_balance 有值
+            if 'wallet_balance' not in tx_data or tx_data['wallet_balance'] is None:
+                tx_data['wallet_balance'] = 0.0
+            
+            # 處理 transaction_time，確保它落在正確的分區範圍內
+            transaction_time = tx_data.get("transaction_time")
+            logger.debug(f"處理交易: wallet={wallet_address}, token={tx_data.get('token_address')}, time={transaction_time}")
+
+            if transaction_time > 9999999999999:  # 如果是微秒時間戳
+                transaction_time = transaction_time // 1000  # 轉換為秒級時間戳
+            elif transaction_time > 9999999999:  # 如果是毫秒時間戳
+                transaction_time = transaction_time // 1000  # 轉換為秒級時間戳
+                
+            tx_data["transaction_time"] = transaction_time
+            tx_data["chain_id"] = 9006
+            tx_data["token_name"] = remove_emoji(tx_data.get('token_name', ''))
+            tx_data["transaction_time"] = make_naive_time(tx_data.get("transaction_time"))
+            tx_data["time"] = make_naive_time(tx_data.get("time", get_utc8_time()))
+
+            # 構建 upsert 語句
+            stmt = insert(Transaction).values(**tx_data).on_conflict_do_update(
+                index_elements=['signature', 'wallet_address', 'token_address', 'transaction_time'],
+                set_=tx_data
+            )
+
+            # 執行插入操作
+            await async_session.execute(stmt)
+            logger.info(f"已寫入 wallet_transaction: {tx_data.get('wallet_address')} {tx_data.get('token_address')} {tx_data.get('transaction_time')}")
+            
+            return True
 
     except Exception as e:
-        print(f"[ERROR] 保存交易記錄失敗: {str(e)}")
-        print(f"[ERROR] 失敗的交易數據: {tx_data}")
-        # 只輸出第一層錯誤堆疊
+        logger.error(f"保存交易記錄失敗: {str(e)}")
+        logger.error(f"失敗的交易數據: {tx_data}")
         import traceback
-        print("[ERROR] 錯誤堆疊:")
-        traceback.print_exc(limit=1)
-        # 直接拋出異常，不再繼續處理
+        logger.error("錯誤堆疊:", exc_info=True)
+        
+        # 如果是自动提交模式，尝试回滚
+        if auto_commit and async_session.in_transaction():
+            try:
+                await async_session.rollback()
+                logger.info("已回滾失敗的事務")
+            except Exception as rollback_error:
+                logger.error(f"回滾事務失敗: {str(rollback_error)}")
+        
+        # 重新抛出异常
         raise
 
 async def get_token_buy_data_with_new_session(wallet_address: str, token_address: str, chain):
@@ -1162,11 +1264,11 @@ async def remove_wallets_from_db(chain, session: AsyncSession, addresses: list):
 
 async def get_active_wallets(chain, session: AsyncSession):
     schema = 'dex_query_v1'
-    FollowWallet.with_schema(schema)
+    WalletSummary.with_schema(schema)
 
     async with session.begin():
-        query = select(FollowWallet.wallet_address).where(
-            FollowWallet.is_active == True
+        query = select(WalletSummary.wallet_address).where(
+            WalletSummary.is_active == True
         )
         result = await session.execute(query)
         wallets = result.scalars().all()
@@ -1210,11 +1312,15 @@ def wallet_to_api_dict(wallet) -> dict:
         )
         
         if not has_transactions:
+            logger.info(f"錢包 {wallet.wallet_address} 沒有交易記錄，跳過 API 推送")
             return None
+
+        logger.info(f"開始轉換錢包數據: {wallet.wallet_address}")
+        logger.debug(f"交易統計 - 30d: {wallet.total_transaction_num_30d}, 7d: {wallet.total_transaction_num_7d}, 1d: {wallet.total_transaction_num_1d}")
 
         # 創建新的字典，首先添加必填項
         api_data = {
-            "wallet_address": wallet.wallet_address,
+            "address": wallet.wallet_address,  # 改為 address
             "chain": wallet.chain.upper() if wallet.chain else "BSC",
             "last_transaction_time": wallet.last_transaction_time,
             "isActive": wallet.is_active if wallet.is_active is not None else True,
@@ -1263,29 +1369,11 @@ def wallet_to_api_dict(wallet) -> dict:
             "total_cost_1d": "totalCost1d",
             "avg_realized_profit_30d": "avgRealizedProfit30d",
             "avg_realized_profit_7d": "avgRealizedProfit7d",
-            "avg_realized_profit_1d": "avgRealizedProfit1d",
-            "distribution_gt500_30d": "distribution_gt500_30d",
-            "distribution_200to500_30d": "distribution_200to500_30d",
-            "distribution_0to200_30d": "distribution_0to200_30d",
-            "distribution_0to50_30d": "distribution_0to50_30d",
-            "distribution_lt50_30d": "distribution_lt50_30d",
-            "distribution_gt500_percentage_30d": "distribution_gt500_percentage_30d",
-            "distribution_200to500_percentage_30d": "distribution_200to500_percentage_30d",
-            "distribution_0to200_percentage_30d": "distribution_0to200_percentage_30d",
-            "distribution_0to50_percentage_30d": "distribution_0to50_percentage_30d",
-            "distribution_lt50_percentage_30d": "distribution_lt50_percentage_30d",
-            "distribution_gt500_7d": "distribution_gt500_7d",
-            "distribution_200to500_7d": "distribution_200to500_7d",
-            "distribution_0to200_7d": "distribution_0to200_7d",
-            "distribution_0to50_7d": "distribution_0to50_7d",
-            "distribution_lt50_7d": "distribution_lt50_7d",
-            "distribution_gt500_percentage_7d": "distribution_gt500_percentage_7d",
-            "distribution_200to500_percentage_7d": "distribution_200to500_percentage_7d",
-            "distribution_0to200_percentage_7d": "distribution_0to200_percentage_7d",
-            "distribution_0to50_percentage_7d": "distribution_0to50_percentage_7d",
-            "distribution_lt50_percentage_7d": "distribution_lt50_percentage_7d"
+            "avg_realized_profit_1d": "avgRealizedProfit1d"
         }
-        numeric_fields = {
+        
+        # 定義需要限制小數位數的數值字段
+        decimal_fields = {
             "balance", "balance_usd", "asset_multiple",
             "avg_cost_30d", "avg_cost_7d", "avg_cost_1d",
             "total_transaction_num_30d", "total_transaction_num_7d", "total_transaction_num_1d",
@@ -1296,43 +1384,62 @@ def wallet_to_api_dict(wallet) -> dict:
             "pnl_percentage_30d", "pnl_percentage_7d", "pnl_percentage_1d",
             "unrealized_profit_30d", "unrealized_profit_7d", "unrealized_profit_1d",
             "total_cost_30d", "total_cost_7d", "total_cost_1d",
-            "avg_realized_profit_30d", "avg_realized_profit_7d", "avg_realized_profit_1d",
-            "distribution_gt500_30d", "distribution_200to500_30d", "distribution_0to200_30d", "distribution_0to50_30d", "distribution_lt50_30d",
-            "distribution_gt500_percentage_30d", "distribution_200to500_percentage_30d", "distribution_0to200_percentage_30d", "distribution_0to50_percentage_30d", "distribution_lt50_percentage_30d",
-            "distribution_gt500_7d", "distribution_200to500_7d", "distribution_0to200_7d", "distribution_0to50_7d", "distribution_lt50_7d",
-            "distribution_gt500_percentage_7d", "distribution_200to500_percentage_7d", "distribution_0to200_percentage_7d", "distribution_0to50_percentage_7d", "distribution_lt50_percentage_7d"
+            "avg_realized_profit_30d", "avg_realized_profit_7d", "avg_realized_profit_1d"
         }
+
+        from decimal import Decimal
 
         # 遍歷所有字段映射
         for db_field, api_field in fields_mapping.items():
             if hasattr(wallet, db_field):
                 value = getattr(wallet, db_field)
                 if value is not None:
-                    if db_field in numeric_fields and isinstance(value, (int, float)) and abs(value) > 1e8:
+                    # 如果是 Decimal 類型，轉換為 float
+                    if isinstance(value, Decimal):
+                        value = float(value)
+                    
+                    # 如果是需要限制小數位數的數值字段
+                    if db_field in decimal_fields and isinstance(value, (int, float)):
+                        # 限制小數位數為10位
+                        value = round(float(value), 10)
+                    # 如果是其他數值字段且超過1e8，則跳過
+                    elif isinstance(value, (int, float)) and abs(value) > 1e8:
                         continue
                     api_data[api_field] = value
 
+        logger.info(f"成功轉換錢包數據: {wallet.wallet_address}")
         return api_data
     except Exception as e:
-        print(f"轉換錢包數據時發生錯誤: {str(e)}")
+        logger.error(f"轉換錢包數據時發生錯誤: {str(e)}")
+        logger.error(f"錢包地址: {getattr(wallet, 'wallet_address', 'unknown')}")
+        logger.error(traceback.format_exc())
         return None
-    
+
 async def push_wallet_to_api(api_data: dict) -> bool:
     """推送錢包數據到 API"""
     try:
         if not api_data:
+            logger.warning("API 數據為空，跳過推送")
             return False
             
+        logger.info(f"準備推送錢包數據到 API: {api_data.get('address')}")  # 改為 address
+        logger.debug(f"完整 API 數據: {api_data}")
+            
         async with aiohttp.ClientSession() as session:
-            async with session.post(WALLET_SYNC_API_ENDPOINT, json=[api_data]) as resp:
+            # 將單個錢包數據包裝成列表
+            data_to_send = [api_data]
+            async with session.post(WALLET_SYNC_API_ENDPOINT, json=data_to_send) as resp:
                 if resp.status == 200:
+                    logger.info(f"成功推送錢包數據到 API: {api_data.get('wallet_address')}")
                     return True
                 else:
                     text = await resp.text()
-                    print(f"API 推送失敗: {resp.status}, {text}")
+                    logger.error(f"API 推送失敗: {resp.status}, {text}")
+                    logger.error(f"失敗的錢包地址: {api_data.get('wallet_address')}")
                     return False
     except Exception as e:
-        print(f"推送到 API 時發生錯誤: {str(e)}")
+        logger.error(f"推送到 API 時發生錯誤: {str(e)}")
+        logger.error(f"錯誤的錢包地址: {api_data.get('wallet_address')}")
         return False
 
     

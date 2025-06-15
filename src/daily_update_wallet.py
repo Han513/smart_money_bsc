@@ -196,7 +196,7 @@ def convert_transaction_format(old_transactions, wallet_address, bnb_usdt_price)
         import traceback
         traceback.print_exc()
     
-    print(f"轉換後的交易數據: {new_transactions}")
+    # print(f"轉換後的交易數據: {new_transactions}")
     return new_transactions
 
 async def get_token_supply(token_address: str) -> Decimal:
@@ -740,13 +740,17 @@ async def calculate_statistics2(transactions, days, bnb_usdt_price):
     # 假設calculate_distribution函數存在
     distribution, distribution_percentage = await calculate_distribution(aggregated_tokens, days)
     
+    
     return {
         "asset_multiple": round(asset_multiple, 2),
         "total_buy": total_buy,
         "total_sell": total_sell,
+        "buy_num": total_buy,
+        "sell_num": total_sell,
         "total_transaction_num": total_buy + total_sell,
         "total_cost": total_cost,
         "average_cost": average_cost,
+        "avg_cost": average_cost,
         "total_profit": total_sell_value,
         "pnl": pnl,
         "pnl_percentage": round(pnl_percentage, 2),
@@ -828,7 +832,7 @@ async def update_smart_wallets_filter(wallet_transactions, bnb_usdt_price, sessi
             "tag": "",
             "is_smart_wallet": True,
             "asset_multiple": float(stats_30d["asset_multiple"]),
-            "token_list": token_list,  # 即使有些代幣沒有symbol或icon也包含在內
+            "token_list": token_list,
             "stats_1d": stats_1d,
             "stats_7d": stats_7d,
             "stats_30d": stats_30d,
@@ -866,7 +870,10 @@ async def update_smart_wallets_filter(wallet_transactions, bnb_usdt_price, sessi
         wallet_data["pnl_pic_1d"] = stats_1d.get("pnl_pic", "")
         wallet_data["pnl_pic_7d"] = stats_7d.get("pnl_pic", "")
         wallet_data["pnl_pic_30d"] = stats_30d.get("pnl_pic", "")
-
+        print(f"[DEBUG] stats_1d: buy_num={wallet_data['stats_1d'].get('buy_num')}, sell_num={wallet_data['stats_1d'].get('sell_num')}, total_transaction_num={wallet_data['stats_1d'].get('total_transaction_num')}")
+        print(f"[DEBUG] stats_7d: buy_num={wallet_data['stats_7d'].get('buy_num')}, sell_num={wallet_data['stats_7d'].get('sell_num')}, total_transaction_num={wallet_data['stats_7d'].get('total_transaction_num')}")
+        print(f"[DEBUG] stats_30d: buy_num={wallet_data['stats_30d'].get('buy_num')}, sell_num={wallet_data['stats_30d'].get('sell_num')}, total_transaction_num={wallet_data['stats_30d'].get('total_transaction_num')}")
+        
         await write_wallet_data_to_db(session, wallet_data, chain)
         current_timestamp = int(time.time())
         thirty_days_ago = current_timestamp - (30 * 24 * 60 * 60)
@@ -939,7 +946,7 @@ async def update_smart_money_data(session, wallet_address, chain, bnb_usdt_price
         else:
             await deactivate_wallets(session, [wallet_address])
     else:
-        print(f"No valid transactions found for {wallet_address}")
+        # print(f"No valid transactions found for {wallet_address}")
         await deactivate_wallets(session, [wallet_address])
 
 async def process_wallet_with_new_session(session_factory, wallet_address, chain):
