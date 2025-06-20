@@ -237,6 +237,11 @@ async def calculate_remaining_tokens_optimized(wallet_address, session, chain, c
             formatted_buy_price = buy_price.quantize(Decimal('0.0000000000'))
             marketcap = formatted_buy_price * supply
             
+            # 檢查 marketcap 是否超過異常值，如果超過則設置為 0
+            if marketcap > Decimal('10000000000'):
+                print(f"代币 {token_address} 的 marketcap 值異常: {marketcap}，設置為 0")
+                marketcap = Decimal('0')
+            
             # 獲取代幣即時價格
             url = token_info.get('url', {})
             symbol = token_info.get('symbol', "")

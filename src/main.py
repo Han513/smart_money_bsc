@@ -18,10 +18,11 @@ import json
 
 from models import WalletSummary
 from database import get_main_session_factory, get_swap_session_factory, get_main_engine, SessionLocal
-from config import DATABASE_URI, DATABASE_URI_SWAP_BSC
+from config import DATABASE_URI, DATABASE_URI_SWAP_BSC, BACKEND_HOST, BACKEND_PORT
 from models import *  # 假設這裡是你的模型引用
 from daily_update_smart_money import WalletAnalyzer
 from transaction_sync import process_wallet_batch
+from event_processor import EventProcessor
 
 # 假設的異步函數來創建時間
 def get_utc8_time():
@@ -80,13 +81,18 @@ async def get_task_status(request_id: str):
         return json.loads(data)
     return None
 
+# 初始化事件處理器
+event_processor = EventProcessor()
+
 def signal_handler(sig, frame):
     print("接收到終止信號，正在關閉應用...")
     # 停止調度器
     scheduler.shutdown(wait=False)
+    # 停止事件處理器
+    event_processor.stop()
     # 關閉所有連接池
     engine.dispose()
-    main_engine.dispose()  # 使用正確的變量名稱
+    main_engine.dispose()
     sys.exit(0)
 
 # 心跳接口，用於檢查服務是否正常運行
@@ -183,8 +189,19 @@ async def update_addresses():
         chain = data.get("chain")
         type = data.get("type")
         addresses = data.get("addresses", [])
-        twitter_names = data.get("twitter_name", [])
-        twitter_usernames = data.get("twitter_username", [])
+        twitter_names = data.get("twitter_names", [])
+        twitter_usernames = data.get("twitter_usernames", [])
+
+        # 添加日誌記錄
+        logging.info(f"接收到的地址數量: {len(addresses)}")
+        # logging.info(f"接收到的twitter_names數量: {len(twitter_names)}")
+        # logging.info(f"接收到的twitter_usernames數量: {len(twitter_usernames)}")
+        
+        # 打印前10個地址及其對應的twitter信息
+        # for i in range(min(10, len(addresses))):
+        #     logging.info(f"地址 {i+1}: {addresses[i]}")
+        #     logging.info(f"  - Twitter Name: {twitter_names[i] if i < len(twitter_names) else 'None'}")
+        #     logging.info(f"  - Twitter Username: {twitter_usernames[i] if i < len(twitter_usernames) else 'None'}")
 
         if not addresses:
             return jsonify({"code": 400, "message": "請提供有效的地址列表"}), 400
@@ -333,7 +350,10 @@ async def startup():
     """
     # 原有代碼
     scheduler.start()  # 啟動 scheduler
-    # app.add_background_task(run_wallet_monitor)
+    
+    # 啟動事件處理器
+    event_processor.start()
+    logging.info("事件處理器已啟動")
     
     # 新增：設置交易同步任務，傳遞引擎實例
     # setup_sync_task(scheduler, SessionLocal, SessionLocal, engine)

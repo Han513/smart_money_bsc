@@ -205,7 +205,7 @@ async def clean_all_bsc_related_data():
         
         async with async_session() as session:
             # 依次執行各清理任務
-            await clean_bsc_wallet_for_addresses_starting_with_zeros(session)
+            # await clean_bsc_wallet_for_addresses_starting_with_zeros(session)
             await clean_bsc_inactive_wallets_holdings(session)
             await clean_bsc_wallet_transaction_for_deleted_wallets(session)
             await clean_bsc_wallet_buy_data_for_deleted_wallets(session)
@@ -858,6 +858,11 @@ async def process_transaction_logic(row, bnb_price, session):
         # 確保 supply 是 Decimal 類型
         supply_decimal = ensure_decimal(supply) if supply else Decimal('0')
         marketcap = price_usd * supply_decimal
+        
+        # 檢查 marketcap 是否超過異常值，如果超過則設置為 0
+        if marketcap > Decimal('10000000000'):
+            logger.warning(f"代币 {token_address} 的 marketcap 值異常: {marketcap}，設置為 0")
+            marketcap = Decimal('0')
 
         # 10. 準備交易數據 - balance['balance_usd'] 已經是 Decimal 類型
         balance_usd = balances.get(wallet_address, {}).get('balance_usd', Decimal('0'))
@@ -1335,14 +1340,14 @@ async def _push_wallet_data_to_api(wallet_data):
 async def main():
     """主程式入口點"""
     # 配置日誌
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(f'smart_money_{datetime.now().strftime("%Y%m%d")}.log')
-        ]
-    )
+    # logging.basicConfig(
+    #     level=logging.INFO,
+    #     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    #     handlers=[
+    #         logging.StreamHandler(),
+    #         logging.FileHandler(f'smart_money_{datetime.now().strftime("%Y%m%d")}.log')
+    #     ]
+    # )
     
     logger.info("開始執行智能錢包分析任務")
     
@@ -1375,10 +1380,104 @@ async def main():
     
     logger.info("智能錢包分析任務完成")
 
+async def execute_daily_task():
+    """執行每日更新任務"""
+    try:
+        logger.info("=== 開始執行每日智能錢包分析任務 ===")
+        
+        # 獲取 BNB 價格
+        try:
+            bnb_price = await get_price()
+            logger.info(f"獲取到 BNB 價格: ${bnb_price}")
+        except Exception as e:
+            logger.error(f"獲取 BNB 價格失敗: {str(e)}")
+            return
+        
+        # 清理資料庫中的無效資料
+        try:
+            logger.info("開始清理資料庫中的無效數據")
+            await clean_all_bsc_related_data()
+        except Exception as e:
+            logger.error(f"清理資料庫失敗: {str(e)}")
+        
+        # 更新 BSC 智能錢包數據
+        try:
+            logger.info("開始更新 BSC 智能錢包數據")
+            await update_bsc_smart_money_data()
+            logger.info("BSC 智能錢包數據更新完成")
+        except Exception as e:
+            logger.error(f"更新 BSC 智能錢包數據失敗: {str(e)}")
+        
+        logger.info("=== 每日智能錢包分析任務完成 ===")
+        
+    except Exception as e:
+        logger.error(f"執行每日任務時發生錯誤: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+def get_next_midnight_utc8():
+    """獲取下一個UTC+8的凌晨00:00時間"""
+    # 獲取當前UTC+8時間
+    now_utc8 = datetime.utcnow() + timedelta(hours=8)
+    
+    # 計算下一個凌晨00:00
+    next_midnight = now_utc8.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    # 如果當前時間已經過了今天的凌晨，則計算明天的凌晨
+    if now_utc8 >= next_midnight:
+        next_midnight += timedelta(days=1)
+    
+    # 轉換回UTC時間
+    next_midnight_utc = next_midnight - timedelta(hours=8)
+    
+    return next_midnight_utc
+
+async def run_with_scheduler():
+    """帶定時任務的主程序"""
+    logger.info("啟動智能錢包分析服務，支持定時執行")
+    
+    # 立即執行一次
+    logger.info("立即執行一次更新任務...")
+    await execute_daily_task()
+    
+    while True:
+        try:
+            # 計算下一個執行時間
+            next_run = get_next_midnight_utc8()
+            now_utc = datetime.utcnow()
+            
+            # 計算等待時間（秒）
+            wait_seconds = (next_run - now_utc).total_seconds()
+            
+            if wait_seconds > 0:
+                logger.info(f"下次執行時間: {next_run.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                logger.info(f"等待時間: {wait_seconds/3600:.2f} 小時")
+                
+                # 等待到下次執行時間
+                await asyncio.sleep(wait_seconds)
+            
+            # 執行每日任務
+            await execute_daily_task()
+            
+        except asyncio.CancelledError:
+            logger.info("收到取消信號，正在關閉服務...")
+            break
+        except Exception as e:
+            logger.error(f"定時任務執行錯誤: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            
+            # 發生錯誤時等待1小時後重試
+            logger.info("等待1小時後重試...")
+            await asyncio.sleep(3600)
+
 # 程式入口點
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        # 使用新的定時任務模式
+        asyncio.run(run_with_scheduler())
+    except KeyboardInterrupt:
+        logger.info("收到中斷信號，程序正在退出...")
     except Exception as e:
         logger.critical(f"程式執行過程中發生嚴重錯誤: {str(e)}")
         import traceback

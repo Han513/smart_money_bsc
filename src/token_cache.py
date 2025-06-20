@@ -3,6 +3,8 @@ import json
 from decimal import Decimal
 from datetime import datetime, timedelta
 import logging
+from sqlalchemy import select
+from models import TokenBuyData, WalletTokenState
 
 logger = logging.getLogger(__name__)
 
@@ -22,14 +24,61 @@ class TokenCache:
     def _str_to_decimal(self, data):
         """将字典中的字符串转换为 Decimal"""
         decimal_fields = {'total_amount', 'total_cost', 'avg_buy_price', 'realized_profit', 'realized_profit_percentage'}
-        return {k: Decimal(v) if k in decimal_fields and v is not None else v for k, v in data.items()}
+        for key in decimal_fields:
+            if key in data and data[key] is not None:
+                try:
+                    data[key] = Decimal(str(data[key]))
+                except Exception:
+                    data[key] = Decimal('0')
+            else:
+                data[key] = Decimal('0')
+        return data
 
-    def get_token_data(self, wallet_address, token_address):
-        """获取代币数据"""
+    async def get_token_data(self, wallet_address, token_address, session):
+        """获取代币数据，优先Redis，其次DB，最后默认"""
         key = self._get_key(wallet_address, token_address)
-        data = self.redis.get(key)
-        if data:
-            return self._str_to_decimal(json.loads(data))
+        
+        # 1. Try Redis cache
+        try:
+            cached_data_str = self.redis.get(key)
+            if cached_data_str:
+                return self._str_to_decimal(json.loads(cached_data_str))
+        except Exception as e:
+            logger.error(f"访问 Redis 失败: {e}")
+
+        # 2. Try DB (from new wallet_token_state table)
+        try:
+            stmt = select(WalletTokenState).where(
+                WalletTokenState.wallet_address == wallet_address,
+                WalletTokenState.token_address == token_address,
+                WalletTokenState.chain == 'BSC' # Hardcoded for now
+            )
+            
+            result = await session.execute(stmt)
+            latest_record = result.scalar_one_or_none()
+
+            if latest_record:
+                logger.info(f"缓存未命中，从数据库加载状态: {wallet_address}/{token_address}")
+                # We only need the *current* state for calculations
+                db_data = {
+                    'total_amount': latest_record.current_amount,
+                    'total_cost': latest_record.current_total_cost,
+                    'avg_buy_price': latest_record.current_avg_buy_price,
+                    'realized_profit': latest_record.historical_realized_pnl, # Use historical for tracking
+                    'realized_profit_percentage': 0, # This is trade-specific, not stateful
+                    'last_transaction_time': latest_record.last_transaction_time
+                }
+                # Put it back in Redis for next time
+                try:
+                    self.redis.set(key, json.dumps(self._decimal_to_str(db_data)))
+                except Exception as e:
+                    logger.error(f"写回 Redis 缓存失败: {e}")
+                
+                return self._str_to_decimal(db_data)
+        except Exception as e:
+            logger.error(f"从数据库加载缓存状态失败: {e}")
+
+        # 3. Return default if not found anywhere
         return {
             'total_amount': Decimal('0'),
             'total_cost': Decimal('0'),
@@ -39,10 +88,8 @@ class TokenCache:
             'last_transaction_time': 0
         }
 
-    def update_token_data(self, wallet_address, token_address, side, amount, value, current_time):
-        """更新代币数据"""
-        key = self._get_key(wallet_address, token_address)
-        token_data = self.get_token_data(wallet_address, token_address)
+    def update_token_data(self, wallet_address, token_address, side, amount, value, current_time, token_data):
+        """更新代币数据 (token_data is the state before this trade)"""
         
         amount = Decimal(str(amount))
         value = Decimal(str(value))
@@ -56,14 +103,10 @@ class TokenCache:
             token_data.update({
                 'total_amount': new_total_amount,
                 'total_cost': new_total_cost,
-                'avg_buy_price': new_avg_price,
-                'realized_profit': token_data.get('realized_profit', Decimal('0')),
-                'realized_profit_percentage': token_data.get('realized_profit_percentage', Decimal('0'))
+                'avg_buy_price': new_avg_price
             })
             
-            logger.info(f"买入更新 - 钱包: {wallet_address}, 代币: {token_address}")
-            logger.info(f"数量: {amount}, 价值: {value}")
-            logger.info(f"新总量: {new_total_amount}, 新总成本: {new_total_cost}, 新均价: {new_avg_price}")
+            # logger.info(f"买入更新 - 钱包: {wallet_address}, 代币: {token_address}")
             
         else:
             # 卖出逻辑
@@ -93,18 +136,16 @@ class TokenCache:
                 token_data['realized_profit'] = token_data.get('realized_profit', Decimal('0')) + realized_profit
                 token_data['realized_profit_percentage'] = realized_profit_percentage
                 
-                logger.info(f"卖出更新 - 钱包: {wallet_address}, 代币: {token_address}")
-                logger.info(f"卖出数量: {amount}, 卖出价值: {value}")
-                logger.info(f"成本基础: {cost_basis}, 已实现利润: {realized_profit}, 利润率: {realized_profit_percentage}%")
+                # logger.info(f"卖出更新 - 钱包: {wallet_address}, 代币: {token_address}")
             else:
                 # 处理超卖情况
                 token_data['total_amount'] -= amount
                 token_data['realized_profit'] = Decimal('0')
-                token_data['realized_profit_percentage'] = Decimal('-100')
+                token_data['realized_profit_percentage'] = Decimal('0')
                 
-                logger.info(f"超卖情况 - 钱包: {wallet_address}, 代币: {token_address}")
-                logger.info(f"当前持仓: {token_data['total_amount']}, 卖出数量: {amount}")
-            
+                # logger.info(f"超卖情况 - 钱包: {wallet_address}, 代币: {token_address}")
+        
+        key = self._get_key(wallet_address, token_address)
         token_data['last_transaction_time'] = current_time
         self.redis.set(key, json.dumps(self._decimal_to_str(token_data)))
         return token_data
@@ -129,42 +170,9 @@ class TokenCache:
             self.last_flush_time = now
 
     async def flush_to_db(self, session):
-        """将缓存数据刷新到数据库"""
-        from models import save_wallet_buy_data  # 避免循环导入
-        
-        keys = self.redis.keys("token:*")
-        for key in keys:
-            try:
-                wallet_address, token_address = key.split(":")[1:3]
-                data = self.get_token_data(wallet_address, token_address)
-                
-                # 准备要保存的数据
-                save_data = {
-                    "token_address": token_address,
-                    "total_amount": float(data['total_amount']),
-                    "total_cost": float(data['total_cost']),
-                    "avg_buy_price": float(data['avg_buy_price']),
-                    "realized_profit": float(data['realized_profit']),
-                    "realized_profit_percentage": float(data['realized_profit_percentage']),
-                    "last_transaction_time": data['last_transaction_time'],
-                    "date": datetime.now().date()
-                }
-                
-                await save_wallet_buy_data(
-                    wallet_address,
-                    save_data,
-                    token_address,
-                    session,
-                    "BSC",
-                    auto_commit=True
-                )
-                
-                logger.info(f"已将缓存数据刷新到数据库 - 钱包: {wallet_address}, 代币: {token_address}")
-                logger.info(f"数据: {save_data}")
-                
-            except Exception as e:
-                logger.error(f"刷新缓存数据到数据库时出错: {str(e)}")
-                continue
+        """将缓存数据刷新到数据库(此函數將被廢棄，改為即時更新)"""
+        logger.warning("flush_to_db is deprecated and should not be used. State is now persisted in real-time.")
+        return
 
 # 创建全局缓存实例
 token_cache = TokenCache() 

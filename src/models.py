@@ -10,18 +10,19 @@ from dotenv import load_dotenv
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, Text, select, update, Index, text, distinct, case, delete, BIGINT
+from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, Text, select, update, Index, text, distinct, case, delete, BIGINT, UniqueConstraint
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.declarative import as_declarative, declared_attr
 from config import *
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from sqlalchemy.dialects.postgresql import insert
+from event_processor import EventProcessor
 
 load_dotenv()
 
 # 設置日誌
 logger = logging.getLogger(__name__)
-logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+# logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 
 # 初始化資料庫
 Base = declarative_base()
@@ -72,6 +73,41 @@ class Base:
             if table.name == cls.__tablename__:
                 table.schema = schema
         return cls
+
+class WalletTokenState(Base):
+    __tablename__ = 'wallet_token_state'
+    __table_args__ = (
+        UniqueConstraint('wallet_address', 'token_address', 'chain', name='uq_wallet_token_chain'),
+        {'schema': 'dex_query_v1'}
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    wallet_address = Column(String(100), nullable=False, comment="钱包地址")
+    token_address = Column(String(100), nullable=False, comment="代币地址")
+    chain = Column(String(50), nullable=False, comment="链名称 (例如 'BSC', 'SOLANA')")
+    chain_id = Column(Integer, nullable=False, comment="链 ID")
+    
+    # 当前持仓状态
+    current_amount = Column(Float, nullable=False, default=0.0, comment="当前持仓数量")
+    current_total_cost = Column(Float, nullable=False, default=0.0, comment="当前持仓的总成本")
+    current_avg_buy_price = Column(Float, nullable=False, default=0.0, comment="当前持仓的平均买入价")
+    position_opened_at = Column(BIGINT, nullable=True, comment="当前仓位的首次建立时间 (Unix timestamp)")
+    
+    # 历史累计状态
+    historical_buy_amount = Column(Float, nullable=False, default=0.0, comment="历史累计总买入数量")
+    historical_sell_amount = Column(Float, nullable=False, default=0.0, comment="历史累计总卖出数量")
+    historical_buy_cost = Column(Float, nullable=False, default=0.0, comment="历史累计总买入成本")
+    historical_sell_value = Column(Float, nullable=False, default=0.0, comment="历史累计总卖出价值")
+    historical_realized_pnl = Column(Float, nullable=False, default=0.0, comment="历史累计已实现盈亏")
+    historical_buy_count = Column(Integer, nullable=False, default=0, comment="历史累计买入次数")
+    historical_sell_count = Column(Integer, nullable=False, default=0, comment="历史累计卖出次数")
+    
+    # 元数据
+    last_transaction_time = Column(BIGINT, nullable=True, comment="最后一次交易的时间 (Unix timestamp)")
+    updated_at = Column(DateTime, nullable=False, default=get_utc8_time, comment="本条记录的最后更新时间")
+
+    def as_dict(self):
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
 
 class WalletSummary(Base):
     __tablename__ = 'wallet'
@@ -191,7 +227,10 @@ class Holding(Base):
 
 class Transaction(Base):
     __tablename__ = 'wallet_transaction'
-    __table_args__ = {'schema': 'dex_query_v1'}
+    __table_args__ = (
+        UniqueConstraint('wallet_address', 'token_address', 'transaction_time', 'signature', name='wallet_transaction_pkey'),
+        {'schema': 'dex_query_v1'}
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     wallet_address = Column(String(100), nullable=False, comment="聰明錢錢包地址")
@@ -223,13 +262,6 @@ class Transaction(Base):
 
     def as_dict(self):
         return {c.name: getattr(self, c.name) for c in self.__table__.columns}
-    
-    # 考慮添加一個用於代幣雙向交易的索引
-    __table_args__ = (
-        Index('idx_transaction_signature_time', 'signature', 'transaction_time'),
-        Index('idx_wallet_token', 'wallet_address', 'token_address'),
-        # 如果需要優化查詢，可添加更多索引
-    )
 
 class TokenBuyData(Base):
     __tablename__ = 'wallet_buy_data'
@@ -314,214 +346,54 @@ def convert_to_decimal(value: Union[float, str, None]) -> Union[Decimal, None]:
         return Decimal('0')
 
 async def write_wallet_data_to_db(session, wallet_data, chain, twitter_name: Optional[str] = None, twitter_username: Optional[str] = None):
-    """
-    将钱包数据写入或更新 WalletSummary 表
-    
-    Args:
-        session: 数据库会话
-        wallet_data: 钱包数据字典
-        chain: 链名称
-        twitter_name: Twitter 名称（可选）
-        twitter_username: Twitter 用户名（可选）
-    """
-    schema = "dex_query_v1"
-    await session.execute(text("SET search_path TO dex_query_v1;"))
-    WalletSummary.with_schema(schema)
     try:
-        if 'wallet_address' not in wallet_data:
-            raise ValueError("wallet_data 缺少 wallet_address 鍵")
-        # 查詢是否已經存在相同的 wallet_address
+        # 確保 update_time 是 naive datetime
+        if isinstance(wallet_data.get('update_time'), datetime):
+            wallet_data['update_time'] = wallet_data['update_time'].replace(tzinfo=None)
+            
+        # 自動補齊last_transaction_time與chain_id
+        if 'last_transaction_time' not in wallet_data:
+            wallet_data['last_transaction_time'] = 0
+        if 'chain_id' not in wallet_data or wallet_data['chain_id'] is None:
+            chain_map = {'BSC': 9006, 'SOLANA': 501}
+            wallet_data['chain_id'] = chain_map.get(wallet_data.get('chain', 'BSC').upper(), 9006)
+
+        # 檢查錢包是否已存在
         existing_wallet = await session.execute(
-            select(WalletSummary).filter(WalletSummary.wallet_address == wallet_data["wallet_address"])
+            select(WalletSummary).where(WalletSummary.wallet_address == wallet_data['wallet_address'])
         )
-        existing_wallet = existing_wallet.scalars().first()
+        existing_wallet = existing_wallet.scalar_one_or_none()
+
         if existing_wallet:
-            existing_wallet.balance = wallet_data.get("balance", 0)
-            existing_wallet.balance_usd = wallet_data.get("balance_usd", 0)
-            existing_wallet.chain = wallet_data.get("chain", "BSC")
-            existing_wallet.is_smart_wallet = wallet_data.get("is_smart_wallet", True)
-            existing_wallet.wallet_type = wallet_data.get("wallet_type", 0)
-            existing_wallet.asset_multiple = wallet_data.get("asset_multiple", 0)
-            existing_wallet.token_list = wallet_data.get("token_list", "")
-            existing_wallet.is_active = wallet_data.get("is_active", True)
+            # 更新已存在的錢包
+            logger.info(f"更新已存在的錢包: {wallet_data['wallet_address']}")
+            for key, value in wallet_data.items():
+                if hasattr(existing_wallet, key):
+                    setattr(existing_wallet, key, value)
             
             # 更新 Twitter 信息
             if twitter_name is not None:
                 existing_wallet.twitter_name = twitter_name
             if twitter_username is not None:
                 existing_wallet.twitter_username = twitter_username
-            if twitter_name and twitter_username:
-                existing_wallet.tag = "kol"
-                existing_wallet.is_smart_wallet = True
-            
-            # 30天统计数据更新
-            existing_wallet.avg_cost_30d = wallet_data["stats_30d"].get("avg_cost", 0)
-            existing_wallet.total_transaction_num_30d = wallet_data["stats_30d"].get("total_transaction_num", 0)
-            existing_wallet.buy_num_30d = wallet_data["stats_30d"].get("buy_num", 0)
-            existing_wallet.sell_num_30d = wallet_data["stats_30d"].get("sell_num", 0)
-            existing_wallet.win_rate_30d = wallet_data["stats_30d"].get("win_rate", 0)
-            existing_wallet.pnl_30d = wallet_data["stats_30d"].get("pnl", 0)
-            existing_wallet.pnl_percentage_30d = wallet_data["stats_30d"].get("pnl_percentage", 0)
-            existing_wallet.unrealized_profit_30d = wallet_data["stats_30d"].get("unrealized_profit", 0)
-            existing_wallet.total_cost_30d = wallet_data["stats_30d"].get("total_cost", 0)
-            existing_wallet.avg_realized_profit_30d = wallet_data["stats_30d"].get("avg_realized_profit", 0)
-            
-            # 7天统计数据更新
-            existing_wallet.avg_cost_7d = wallet_data["stats_7d"].get("avg_cost", 0)
-            existing_wallet.total_transaction_num_7d = wallet_data["stats_7d"].get("total_transaction_num", 0)
-            existing_wallet.buy_num_7d = wallet_data["stats_7d"].get("buy_num", 0)
-            existing_wallet.sell_num_7d = wallet_data["stats_7d"].get("sell_num", 0)
-            existing_wallet.win_rate_7d = wallet_data["stats_7d"].get("win_rate", 0)
-            existing_wallet.pnl_7d = wallet_data["stats_7d"].get("pnl", 0)
-            existing_wallet.pnl_percentage_7d = wallet_data["stats_7d"].get("pnl_percentage", 0)
-            existing_wallet.unrealized_profit_7d = wallet_data["stats_7d"].get("unrealized_profit", 0)
-            existing_wallet.total_cost_7d = wallet_data["stats_7d"].get("total_cost", 0)
-            existing_wallet.avg_realized_profit_7d = wallet_data["stats_7d"].get("avg_realized_profit", 0)
-            
-            # 1天统计数据更新
-            existing_wallet.avg_cost_1d = wallet_data["stats_1d"].get("avg_cost", 0)
-            existing_wallet.total_transaction_num_1d = wallet_data["stats_1d"].get("total_transaction_num", 0)
-            existing_wallet.buy_num_1d = wallet_data["stats_1d"].get("buy_num", 0)
-            existing_wallet.sell_num_1d = wallet_data["stats_1d"].get("sell_num", 0)
-            existing_wallet.win_rate_1d = wallet_data["stats_1d"].get("win_rate", 0)
-            existing_wallet.pnl_1d = wallet_data["stats_1d"].get("pnl", 0)
-            existing_wallet.pnl_percentage_1d = wallet_data["stats_1d"].get("pnl_percentage", 0)
-            existing_wallet.unrealized_profit_1d = wallet_data["stats_1d"].get("unrealized_profit", 0)
-            existing_wallet.total_cost_1d = wallet_data["stats_1d"].get("total_cost", 0)
-            existing_wallet.avg_realized_profit_1d = wallet_data["stats_1d"].get("avg_realized_profit", 0)
-            
-            # PNL图片更新
-            existing_wallet.pnl_pic_30d = wallet_data.get("pnl_pic_30d", "")
-            existing_wallet.pnl_pic_7d = wallet_data.get("pnl_pic_7d", "")
-            existing_wallet.pnl_pic_1d = wallet_data.get("pnl_pic_1d", "")
-            
-            # 30天分布数据更新
-            existing_wallet.distribution_gt500_30d = wallet_data["distribution_30d"].get("gt500", 0)
-            existing_wallet.distribution_200to500_30d = wallet_data["distribution_30d"].get("200to500", 0)
-            existing_wallet.distribution_0to200_30d = wallet_data["distribution_30d"].get("0to200", 0)
-            existing_wallet.distribution_0to50_30d = wallet_data["distribution_30d"].get("0to50", 0)
-            existing_wallet.distribution_lt50_30d = wallet_data["distribution_30d"].get("lt50", 0)
-            
-            # 30天分布百分比更新
-            existing_wallet.distribution_gt500_percentage_30d = wallet_data["distribution_percentage_30d"].get("gt500", 0.0)
-            existing_wallet.distribution_200to500_percentage_30d = wallet_data["distribution_percentage_30d"].get("200to500", 0.0)
-            existing_wallet.distribution_0to200_percentage_30d = wallet_data["distribution_percentage_30d"].get("0to200", 0.0)
-            existing_wallet.distribution_0to50_percentage_30d = wallet_data["distribution_percentage_30d"].get("0to50", 0.0)
-            existing_wallet.distribution_lt50_percentage_30d = wallet_data["distribution_percentage_30d"].get("lt50", 0.0)
-            
-            # 7天分布数据更新
-            existing_wallet.distribution_gt500_7d = wallet_data["distribution_7d"].get("gt500", 0)
-            existing_wallet.distribution_200to500_7d = wallet_data["distribution_7d"].get("200to500", 0)
-            existing_wallet.distribution_0to200_7d = wallet_data["distribution_7d"].get("0to200", 0)
-            existing_wallet.distribution_0to50_7d = wallet_data["distribution_7d"].get("0to50", 0)
-            existing_wallet.distribution_lt50_7d = wallet_data["distribution_7d"].get("lt50", 0)
-            
-            # 7天分布百分比更新
-            existing_wallet.distribution_gt500_percentage_7d = wallet_data["distribution_percentage_7d"].get("gt500", 0.0)
-            existing_wallet.distribution_200to500_percentage_7d = wallet_data["distribution_percentage_7d"].get("200to500", 0.0)
-            existing_wallet.distribution_0to200_percentage_7d = wallet_data["distribution_percentage_7d"].get("0to200", 0.0)
-            existing_wallet.distribution_0to50_percentage_7d = wallet_data["distribution_percentage_7d"].get("0to50", 0.0)
-            existing_wallet.distribution_lt50_percentage_7d = wallet_data["distribution_percentage_7d"].get("lt50", 0.0)
-            
-            # 更新时间
-            existing_wallet.update_time = get_utc8_time()
-            existing_wallet.last_transaction_time = wallet_data.get("last_transaction_time", int(datetime.now(timezone.utc).timestamp()))
-            
-            print(f"Successfully updated wallet: {wallet_data['wallet_address']}")
-            
-            # 將錢包資料轉換為 API 格式並推送到後端
-            api_data = wallet_to_api_dict(existing_wallet)
-            if api_data:
-                await push_wallet_to_api(api_data)
-        else:
-            # 如果不存在，就創建新記錄
-            wallet_summary = WalletSummary(
-                wallet_address=wallet_data["wallet_address"],
-                balance=wallet_data.get("balance", 0),
-                balance_usd=wallet_data.get("balance_usd", 0),
-                chain=wallet_data.get("chain", "BSC"),
-                # is_smart_wallet=wallet_data.get("is_smart_wallet", True),
-                wallet_type=wallet_data.get("wallet_type", 0),
-                asset_multiple=wallet_data.get("asset_multiple", 0),
-                token_list=wallet_data.get("token_list", ""),
-                twitter_name=twitter_name,
-                twitter_username=twitter_username,
-                tag="kol" if twitter_name and twitter_username else None,
-                is_smart_wallet=True if twitter_name and twitter_username else False,
-                avg_cost_30d=wallet_data["stats_30d"].get("avg_cost", 0),
-                avg_cost_7d=wallet_data["stats_7d"].get("avg_cost", 0),
-                avg_cost_1d=wallet_data["stats_1d"].get("avg_cost", 0),
-                total_transaction_num_30d=wallet_data["stats_30d"].get("total_transaction_num", 0),
-                total_transaction_num_7d=wallet_data["stats_7d"].get("total_transaction_num", 0),
-                total_transaction_num_1d=wallet_data["stats_1d"].get("total_transaction_num", 0),
-                buy_num_30d=wallet_data["stats_30d"].get("buy_num", 0),
-                buy_num_7d=wallet_data["stats_7d"].get("buy_num", 0),
-                buy_num_1d=wallet_data["stats_1d"].get("buy_num", 0),
-                sell_num_30d=wallet_data["stats_30d"].get("sell_num", 0),
-                sell_num_7d=wallet_data["stats_7d"].get("sell_num", 0),
-                sell_num_1d=wallet_data["stats_1d"].get("sell_num", 0),
-                win_rate_30d=wallet_data["stats_30d"].get("win_rate", 0),
-                win_rate_7d=wallet_data["stats_7d"].get("win_rate", 0),
-                win_rate_1d=wallet_data["stats_1d"].get("win_rate", 0),
-                pnl_30d=wallet_data["stats_30d"].get("pnl", 0),
-                pnl_7d=wallet_data["stats_7d"].get("pnl", 0),
-                pnl_1d=wallet_data["stats_1d"].get("pnl", 0),
-                pnl_percentage_30d=wallet_data["stats_30d"].get("pnl_percentage", 0),
-                pnl_percentage_7d=wallet_data["stats_7d"].get("pnl_percentage", 0),
-                pnl_percentage_1d=wallet_data["stats_1d"].get("pnl_percentage", 0),
-                pnl_pic_30d=wallet_data.get("pnl_pic_30d", ""),
-                pnl_pic_7d=wallet_data.get("pnl_pic_7d", ""),
-                pnl_pic_1d=wallet_data.get("pnl_pic_1d", ""),
-                unrealized_profit_30d=wallet_data["stats_30d"].get("unrealized_profit", 0),
-                unrealized_profit_7d=wallet_data["stats_7d"].get("unrealized_profit", 0),
-                unrealized_profit_1d=wallet_data["stats_1d"].get("unrealized_profit", 0),
-                total_cost_30d=wallet_data["stats_30d"].get("total_cost", 0),
-                total_cost_7d=wallet_data["stats_7d"].get("total_cost", 0),
-                total_cost_1d=wallet_data["stats_1d"].get("total_cost", 0),
-                avg_realized_profit_30d=wallet_data["stats_30d"].get("avg_realized_profit", 0),
-                avg_realized_profit_7d=wallet_data["stats_7d"].get("avg_realized_profit", 0),
-                avg_realized_profit_1d=wallet_data["stats_1d"].get("avg_realized_profit", 0),
-                distribution_gt500_30d=wallet_data["distribution_30d"].get("gt500", 0),
-                distribution_200to500_30d=wallet_data["distribution_30d"].get("200to500", 0),
-                distribution_0to200_30d=wallet_data["distribution_30d"].get("0to200", 0),
-                distribution_0to50_30d=wallet_data["distribution_30d"].get("0to50", 0),
-                distribution_lt50_30d=wallet_data["distribution_30d"].get("lt50", 0),
-                distribution_gt500_percentage_30d=wallet_data["distribution_percentage_30d"].get("gt500", 0.0),
-                distribution_200to500_percentage_30d=wallet_data["distribution_percentage_30d"].get("200to500", 0.0),
-                distribution_0to200_percentage_30d=wallet_data["distribution_percentage_30d"].get("0to200", 0.0),
-                distribution_0to50_percentage_30d=wallet_data["distribution_percentage_30d"].get("0to50", 0.0),
-                distribution_lt50_percentage_30d=wallet_data["distribution_percentage_30d"].get("lt50", 0.0),
-                distribution_gt500_7d=wallet_data["distribution_7d"].get("gt500", 0),
-                distribution_200to500_7d=wallet_data["distribution_7d"].get("200to500", 0),
-                distribution_0to200_7d=wallet_data["distribution_7d"].get("0to200", 0),
-                distribution_0to50_7d=wallet_data["distribution_7d"].get("0to50", 0),
-                distribution_lt50_7d=wallet_data["distribution_7d"].get("lt50", 0),
-                distribution_gt500_percentage_7d=wallet_data["distribution_percentage_7d"].get("gt500", 0.0),
-                distribution_200to500_percentage_7d=wallet_data["distribution_percentage_7d"].get("200to500", 0.0),
-                distribution_0to200_percentage_7d=wallet_data["distribution_percentage_7d"].get("0to200", 0.0),
-                distribution_0to50_percentage_7d=wallet_data["distribution_percentage_7d"].get("0to50", 0.0),
-                distribution_lt50_percentage_7d=wallet_data["distribution_percentage_7d"].get("lt50", 0.0),
-                is_active=wallet_data.get("is_active", True),
-                update_time=get_utc8_time(),
-                last_transaction_time=wallet_data.get("last_transaction_time", int(datetime.now(timezone.utc).timestamp()))
-            )
-            session.add(wallet_summary)
-            print(f"Successfully added wallet: {wallet_data['wallet_address']}")
-            
-            # 將新增的錢包資料轉換為 API 格式並推送到後端
-            api_data = wallet_to_api_dict(wallet_summary)
-            print(f"api_data: {api_data}")
-            if api_data:
-                await push_wallet_to_api(api_data)
                 
-        return True
+            await session.commit()
+            return existing_wallet
+        else:
+            # 創建新錢包
+            logger.info(f"創建新錢包: {wallet_data['wallet_address']}")
+            new_wallet = WalletSummary(**wallet_data)
+            if twitter_name is not None:
+                new_wallet.twitter_name = twitter_name
+            if twitter_username is not None:
+                new_wallet.twitter_username = twitter_username
+            session.add(new_wallet)
+            await session.commit()
+            return new_wallet
     except Exception as e:
-        # 安全地獲取 wallet_address (即使不存在也不會拋出錯誤)
-        wallet_address = wallet_data.get('wallet_address', 'unknown')
-        print(f"Error saving wallet: {wallet_address} - {str(e)}")
-        # 輸出完整的 wallet_data 以便調試
-        print(f"wallet_data 內容: {wallet_data.keys()}")
-        return False
+        logger.error(f"提交錢包數據時發生錯誤: {e}")
+        await session.rollback()
+        raise
 
 async def save_holding(tx_data_list: list, wallet_address: str, session: AsyncSession, chain: str):
     """Save transaction record to the database, and delete tokens no longer held in bulk"""
@@ -936,71 +808,83 @@ async def save_past_transaction(async_session, tx_data, wallet_address, signatur
     logger = logging.getLogger(__name__)
     
     try:
-        # 如果会话已经在事务中且已中止，先回滚
-        if async_session.in_transaction():
-            try:
-                await async_session.rollback()
-                logger.info("已回滾之前失敗的事務")
-            except Exception as e:
-                logger.error(f"回滾事務失敗: {str(e)}")
-                # 如果回滚失败，创建新会话
-                async_session = AsyncSession(async_session.get_bind())
+        # 設置 schema
+        await async_session.execute(text("SET search_path TO dex_query_v1;"))
+        Transaction.with_schema('dex_query_v1')
         
-        # 开始新的事务
-        async with async_session.begin():
-            schema = 'dex_query_v1'
-            await async_session.execute(text("SET search_path TO dex_query_v1;"))
-            Transaction.with_schema(schema)
-            WalletSummary.with_schema(schema)
+        # 準備交易數據
+        tx_data_copy = tx_data.copy()
+        tx_data_copy.pop('id', None)
+        
+        # 設置默認值和數據處理
+        if 'wallet_balance' not in tx_data_copy or tx_data_copy['wallet_balance'] is None:
+            tx_data_copy['wallet_balance'] = 0.0
             
-            tx_data.pop('id', None)
+        # 處理時間
+        if isinstance(tx_data_copy.get('time'), str):
+            tx_data_copy['time'] = datetime.fromisoformat(tx_data_copy['time'])
             
-            # 確保 wallet_balance 有值
-            if 'wallet_balance' not in tx_data or tx_data['wallet_balance'] is None:
-                tx_data['wallet_balance'] = 0.0
-            
-            # 處理 transaction_time，確保它落在正確的分區範圍內
-            transaction_time = tx_data.get("transaction_time")
-            logger.debug(f"處理交易: wallet={wallet_address}, token={tx_data.get('token_address')}, time={transaction_time}")
-
-            if transaction_time > 9999999999999:  # 如果是微秒時間戳
-                transaction_time = transaction_time // 1000  # 轉換為秒級時間戳
-            elif transaction_time > 9999999999:  # 如果是毫秒時間戳
-                transaction_time = transaction_time // 1000  # 轉換為秒級時間戳
-                
-            tx_data["transaction_time"] = transaction_time
-            tx_data["chain_id"] = 9006
-            tx_data["token_name"] = remove_emoji(tx_data.get('token_name', ''))
-            tx_data["transaction_time"] = make_naive_time(tx_data.get("transaction_time"))
-            tx_data["time"] = make_naive_time(tx_data.get("time", get_utc8_time()))
-
-            # 構建 upsert 語句
-            stmt = insert(Transaction).values(**tx_data).on_conflict_do_update(
-                index_elements=['signature', 'wallet_address', 'token_address', 'transaction_time'],
-                set_=tx_data
+        # 將毫秒級時間戳轉換為秒級
+        if 'transaction_time' in tx_data_copy and tx_data_copy['transaction_time'] > 9999999999:
+            tx_data_copy['transaction_time'] = int(tx_data_copy['transaction_time'] / 1000)
+            # logger.info(f"轉換時間戳從毫秒到秒: {tx_data_copy['transaction_time']}")
+        
+        # 使用正確的唯一約束進行 upsert
+        stmt = text("""
+            INSERT INTO dex_query_v1.wallet_transaction (
+                wallet_address, wallet_balance, token_address, token_icon, token_name,
+                price, amount, marketcap, value, holding_percentage, chain, chain_id,
+                realized_profit, realized_profit_percentage, transaction_type,
+                transaction_time, time, signature, from_token_address, dest_token_address,
+                from_token_symbol, dest_token_symbol, from_token_amount, dest_token_amount
             )
-
-            # 執行插入操作
-            await async_session.execute(stmt)
-            logger.info(f"已寫入 wallet_transaction: {tx_data.get('wallet_address')} {tx_data.get('token_address')} {tx_data.get('transaction_time')}")
-            
-            return True
-
+            VALUES (
+                :wallet_address, :wallet_balance, :token_address, :token_icon, :token_name,
+                :price, :amount, :marketcap, :value, :holding_percentage, :chain, :chain_id,
+                :realized_profit, :realized_profit_percentage, :transaction_type,
+                :transaction_time, :time, :signature, :from_token_address, :dest_token_address,
+                :from_token_symbol, :dest_token_symbol, :from_token_amount, :dest_token_amount
+            )
+            ON CONFLICT (wallet_address, token_address, transaction_time, signature) DO UPDATE SET
+                wallet_balance = EXCLUDED.wallet_balance,
+                token_icon = EXCLUDED.token_icon,
+                token_name = EXCLUDED.token_name,
+                price = EXCLUDED.price,
+                amount = EXCLUDED.amount,
+                marketcap = EXCLUDED.marketcap,
+                value = EXCLUDED.value,
+                holding_percentage = EXCLUDED.holding_percentage,
+                realized_profit = EXCLUDED.realized_profit,
+                realized_profit_percentage = EXCLUDED.realized_profit_percentage,
+                transaction_type = EXCLUDED.transaction_type,
+                time = EXCLUDED.time,
+                from_token_address = EXCLUDED.from_token_address,
+                dest_token_address = EXCLUDED.dest_token_address,
+                from_token_symbol = EXCLUDED.from_token_symbol,
+                dest_token_symbol = EXCLUDED.dest_token_symbol,
+                from_token_amount = EXCLUDED.from_token_amount,
+                dest_token_amount = EXCLUDED.dest_token_amount
+        """)
+        
+        # 執行插入或更新
+        await async_session.execute(stmt, tx_data_copy)
+        
+        if auto_commit:
+            await async_session.commit()
+        
+        return True
+        
     except Exception as e:
         logger.error(f"保存交易記錄失敗: {str(e)}")
         logger.error(f"失敗的交易數據: {tx_data}")
-        import traceback
         logger.error("錯誤堆疊:", exc_info=True)
         
-        # 如果是自动提交模式，尝试回滚
-        if auto_commit and async_session.in_transaction():
-            try:
-                await async_session.rollback()
-                logger.info("已回滾失敗的事務")
-            except Exception as rollback_error:
-                logger.error(f"回滾事務失敗: {str(rollback_error)}")
+        try:
+            await async_session.rollback()
+            logger.info("已回滾失敗的事務")
+        except Exception as rollback_error:
+            logger.error(f"回滾事務失敗: {str(rollback_error)}")
         
-        # 重新抛出异常
         raise
 
 async def get_token_buy_data_with_new_session(wallet_address: str, token_address: str, chain):
@@ -1372,7 +1256,7 @@ def wallet_to_api_dict(wallet) -> dict:
             "avg_realized_profit_1d": "avgRealizedProfit1d"
         }
         
-        # 定義需要限制小數位數的數值字段
+        # 定義需要限制小數位數的數值字段（移除字符串字段）
         decimal_fields = {
             "balance", "balance_usd", "asset_multiple",
             "avg_cost_30d", "avg_cost_7d", "avg_cost_1d",
@@ -1387,6 +1271,12 @@ def wallet_to_api_dict(wallet) -> dict:
             "avg_realized_profit_30d", "avg_realized_profit_7d", "avg_realized_profit_1d"
         }
 
+        # 定義字符串字段
+        string_fields = {
+            "tag", "twitter_name", "twitter_username", "token_list", 
+            "pnl_pic_30d", "pnl_pic_7d", "pnl_pic_1d"
+        }
+
         from decimal import Decimal
 
         # 遍歷所有字段映射
@@ -1398,16 +1288,37 @@ def wallet_to_api_dict(wallet) -> dict:
                     if isinstance(value, Decimal):
                         value = float(value)
                     
-                    # 如果是需要限制小數位數的數值字段
-                    if db_field in decimal_fields and isinstance(value, (int, float)):
+                    # 處理字符串字段
+                    if db_field in string_fields:
+                        if isinstance(value, str) and value.strip():  # 確保字符串不為空
+                            api_data[api_field] = value
+                            logger.debug(f"添加字符串字段 {db_field}: {value}")
+                        elif value is not None:  # 非字符串但非空值也添加
+                            api_data[api_field] = str(value)
+                            logger.debug(f"轉換並添加字段 {db_field}: {value}")
+                    
+                    # 處理數值字段
+                    elif db_field in decimal_fields and isinstance(value, (int, float)):
                         # 限制小數位數為10位
                         value = round(float(value), 10)
-                    # 如果是其他數值字段且超過1e8，則跳過
+                        api_data[api_field] = value
+                        logger.debug(f"添加數值字段 {db_field}: {value}")
+                    
+                    # 處理布爾字段
+                    elif db_field == "is_smart_wallet":
+                        api_data[api_field] = bool(value)
+                        logger.debug(f"添加布爾字段 {db_field}: {value}")
+                    
+                    # 處理其他字段（非數值且超過1e8的跳過）
                     elif isinstance(value, (int, float)) and abs(value) > 1e8:
+                        logger.debug(f"跳過超大數值字段 {db_field}: {value}")
                         continue
-                    api_data[api_field] = value
+                    else:
+                        api_data[api_field] = value
+                        logger.debug(f"添加其他字段 {db_field}: {value}")
 
         logger.info(f"成功轉換錢包數據: {wallet.wallet_address}")
+        logger.debug(f"轉換後的API數據: {api_data}")
         return api_data
     except Exception as e:
         logger.error(f"轉換錢包數據時發生錯誤: {str(e)}")
@@ -1430,24 +1341,23 @@ async def push_wallet_to_api(api_data: dict) -> bool:
             data_to_send = [api_data]
             async with session.post(WALLET_SYNC_API_ENDPOINT, json=data_to_send) as resp:
                 if resp.status == 200:
-                    logger.info(f"成功推送錢包數據到 API: {api_data.get('wallet_address')}")
+                    logger.info(f"成功推送錢包數據到 API: {api_data.get('address')}")  # 改為 address
                     return True
                 else:
                     text = await resp.text()
                     logger.error(f"API 推送失敗: {resp.status}, {text}")
-                    logger.error(f"失敗的錢包地址: {api_data.get('wallet_address')}")
+                    logger.error(f"失敗的錢包地址: {api_data.get('address')}")  # 改為 address
                     return False
     except Exception as e:
         logger.error(f"推送到 API 時發生錯誤: {str(e)}")
-        logger.error(f"錯誤的錢包地址: {api_data.get('wallet_address')}")
+        logger.error(f"錯誤的錢包地址: {api_data.get('address')}")  # 改為 address
         return False
-
     
 async def get_token_info_from_db(token_address: str, chain_id: int, session: AsyncSession):
     stmt = text("""
         SELECT 
             address,               -- 作為 token_address
-            name,                  -- 作為 token_name
+            symbol,                  -- 作為 token_name
             logo,                  -- 作為 token_icon
             chain_id,
             supply,
@@ -1467,8 +1377,8 @@ async def get_token_info_from_db(token_address: str, chain_id: int, session: Asy
     if row:
         return {
             "token_address": row.address,
-            "token_name": row.name,
-            "token_icon": row.logo,
+            "name": row.symbol,
+            "logo": row.logo,
             "chain_id": row.chain_id,
             "supply": row.supply,
             "decimals": row.decimals,
