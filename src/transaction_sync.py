@@ -31,12 +31,21 @@ from event_processor import EventProcessor
 from models import WalletTokenState, Base
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy import inspect
+from functools import wraps
 
 logger = logging.getLogger(__name__)
 now_utc_plus_8 = datetime.utcnow() + timedelta(hours=8)
 
 # 初始化 Web3
 w3 = Web3(Web3.HTTPProvider(RPC_URL))
+
+# 常見代幣地址對應符號，先行返回避免查詢
+COMMON_TOKEN_SYMBOLS = {
+    "0x0000000000000000000000000000000000000000": "BNB",
+    "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c": "WBNB",
+    "0x55d398326f99059ff775485246999027b3197955": "USDT",
+    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": "USDC",
+}
 
 class KafkaConsumer:
     def __init__(self, main_session_factory, swap_session_factory, main_engine):
@@ -205,6 +214,31 @@ class KafkaConsumer:
                 from_token_address, dest_token_address = event.get('baseMint', ''), event.get('quoteMint', '')
                 from_token_symbol, dest_token_symbol = event.get('baseSymbol', ''), event.get('quoteSymbol', '')
                 from_token_amount, dest_token_amount = Decimal(str(event.get('fromTokenAmount', '0'))), Decimal(str(event.get('toTokenAmount', '0')))
+            
+            if not from_token_symbol:
+                # 先檢查常見映射
+                from_token_symbol = COMMON_TOKEN_SYMBOLS.get(from_token_address.lower(), '')
+
+            if not from_token_symbol:
+                try:
+                    info = await TokenInfoFetcher.get_token_info(from_token_address.lower())
+                    if info and from_token_address.lower() in info:
+                        token_meta = info[from_token_address.lower()]
+                        from_token_symbol = token_meta.get('symbol', '') or token_meta.get('name', '') or ''
+                except Exception:
+                    from_token_symbol = ''
+
+            if not dest_token_symbol:
+                dest_token_symbol = COMMON_TOKEN_SYMBOLS.get(dest_token_address.lower(), '')
+
+            if not dest_token_symbol:
+                try:
+                    info = await TokenInfoFetcher.get_token_info(dest_token_address.lower())
+                    if info and dest_token_address.lower() in info:
+                        token_meta = info[dest_token_address.lower()]
+                        dest_token_symbol = token_meta.get('symbol', '') or token_meta.get('name', '') or ''
+                except Exception:
+                    dest_token_symbol = ''
 
             try:
                 supply = Decimal(str(token_info.get('supply', '0')))
@@ -800,6 +834,24 @@ async def process_trades_and_update_wallets(wallet, trades, session, bnb_price, 
                     dest_token_symbol = trade.get('quoteSymbol', '') or ''
                     from_token_amount = trade.get('fromTokenAmount', 0) or 0
                     dest_token_amount = trade.get('toTokenAmount', 0) or 0
+
+                if not from_token_symbol:
+                    try:
+                        info = await TokenInfoFetcher.get_token_info(from_token_address.lower())
+                        if info and from_token_address.lower() in info:
+                            token_meta = info[from_token_address.lower()]
+                            from_token_symbol = token_meta.get('symbol', '') or token_meta.get('name', '') or ''
+                    except Exception:
+                        from_token_symbol = ''
+
+                if not dest_token_symbol:
+                    try:
+                        info = await TokenInfoFetcher.get_token_info(dest_token_address.lower())
+                        if info and dest_token_address.lower() in info:
+                            token_meta = info[dest_token_address.lower()]
+                            dest_token_symbol = token_meta.get('symbol', '') or token_meta.get('name', '') or ''
+                    except Exception:
+                        dest_token_symbol = ''
 
                 transaction = {
                     'wallet_address': wallet.wallet_address,

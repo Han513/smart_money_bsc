@@ -1,16 +1,43 @@
 import redis
 import json
+import os
 from decimal import Decimal
 from datetime import datetime, timedelta
 import logging
 from sqlalchemy import select
 from models import TokenBuyData, WalletTokenState
+from config import REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, REDIS_DB, REDIS_POOL_SIZE
 
 logger = logging.getLogger(__name__)
 
 class TokenCache:
-    def __init__(self, host='localhost', port=6379, db=0):
-        self.redis = redis.Redis(host=host, port=port, db=db, decode_responses=True)
+    def __init__(self, host=None, port=None, password=None, db=None, pool_size=None):
+        # 从环境变量获取Redis配置，如果没有提供参数则使用默认值
+        self.host = host or REDIS_HOST
+        self.port = int(port or REDIS_PORT)
+        self.password = password or REDIS_PASSWORD
+        self.db = db if db is not None else REDIS_DB
+        self.pool_size = pool_size if pool_size is not None else REDIS_POOL_SIZE
+        
+        # 创建Redis连接池
+        if self.password:
+            self.redis = redis.Redis(
+                host=self.host, 
+                port=self.port, 
+                password=self.password,
+                db=self.db, 
+                decode_responses=True,
+                max_connections=self.pool_size
+            )
+        else:
+            self.redis = redis.Redis(
+                host=self.host, 
+                port=self.port, 
+                db=self.db, 
+                decode_responses=True,
+                max_connections=self.pool_size
+            )
+        
         self.flush_interval = 300  # 5分钟刷新一次
         self.last_flush_time = datetime.now()
 

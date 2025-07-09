@@ -2,6 +2,7 @@ import os
 import logging
 import traceback
 import asyncio
+import time
 from models import *
 from config import *
 from balance import *
@@ -11,12 +12,40 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 from token_info import TokenInfoFetcher
 from dotenv import load_dotenv
+import aiohttp
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 BUSD_MINT = "0x55d398326f99059fF775485246999027B3197955"
 WBNB_MINT = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
+
+# 後端 API 端點
+API_ENDPOINT = os.getenv("WALLET_SYNC_API_ENDPOINT", "http://moonx.backend:4200/internal/sync_kol_wallets")
+
+# 批量推送錢包資料到 API
+async def push_wallets_batch(wallet_list):
+    """一次性推送多筆錢包資料至 API"""
+    if not wallet_list:
+        return False
+
+    headers = {"Content-Type": "application/json"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(API_ENDPOINT, headers=headers, json=wallet_list) as resp:
+                if resp.status == 200:
+                    logging.info(f"成功批量推送 {len(wallet_list)} 個錢包到 API")
+                    return True
+                else:
+                    logging.error(f"批量推送失敗，狀態碼: {resp.status}")
+                    return False
+    except Exception as e:
+        logging.error(f"批量推送 API 發生錯誤: {e}")
+        return False
+
+def get_update_time():
+    """動態獲取當前 UTC+8 時間 (datetime 物件)"""
+    return datetime.utcnow() + timedelta(hours=8)
 
 async def reset_wallet_buy_data(wallet_address: str, session: AsyncSession, chain):
     """
@@ -464,12 +493,8 @@ async def calculate_token_statistics(transactions, wallet_address, session, chai
                 'last_transaction_time': stats['last_transaction_time']
             }
 
-            try:
-                await save_wallet_buy_data(wallet_address, token_data, token_address, session, chain)
-            except Exception as e:
-                print(f"保存錢包 {wallet_address} 代幣 {token_address} 統計數據時出錯: {e}")
-                import traceback
-                traceback.print_exc()
+            # 保存 TokenBuyData 到資料庫
+            await save_wallet_buy_data(wallet_address, token_data, token_address, session, chain)
 
         # print(f"成功為錢包 {wallet_address} 保存了 {len(token_summary)} 筆代幣交易統計數據")
         
@@ -769,10 +794,12 @@ async def calculate_statistics2(transactions, days, bnb_usdt_price):
 
 async def update_smart_wallets_filter(wallet_transactions, bnb_usdt_price, session, client, chain):
     """根據交易記錄計算盈亏、胜率，並篩選聰明錢包"""
+    batch_api_data = []  # 初始化批量推送資料列表
+    smart_wallet_found = False  # 是否有符合條件的錢包
     for wallet_address, transactions in wallet_transactions.items():
         if not transactions:
             # print(f"錢包 {wallet_address} 沒有交易記錄，跳過處理")
-            return False
+            continue
             
         token_summary = defaultdict(lambda: {'buy_amount': 0, 'sell_amount': 0, 'cost': 0, 'profit': 0, 'marketcap': 0})
         token_last_trade_time = {}
@@ -834,6 +861,7 @@ async def update_smart_wallets_filter(wallet_transactions, bnb_usdt_price, sessi
             "balance": round(balance, 3),
             "balance_usd": round(balance_usd, 2),
             "chain": "BSC",
+            "chain_id": 9006,
             "tag": "",
             "is_smart_wallet": True,
             "asset_multiple": float(stats_30d["asset_multiple"]),
@@ -843,6 +871,7 @@ async def update_smart_wallets_filter(wallet_transactions, bnb_usdt_price, sessi
             "stats_30d": stats_30d,
             "token_summary": token_summary,
             "last_transaction_time": last_transaction_time,
+            "update_time": get_update_time(),
             "distribution_30d": {
                 "gt500": stats_30d.get("distribution_gt500", 0),
                 "200to500": stats_30d.get("distribution_200to500", 0),
@@ -875,11 +904,22 @@ async def update_smart_wallets_filter(wallet_transactions, bnb_usdt_price, sessi
         wallet_data["pnl_pic_1d"] = stats_1d.get("pnl_pic", "")
         wallet_data["pnl_pic_7d"] = stats_7d.get("pnl_pic", "")
         wallet_data["pnl_pic_30d"] = stats_30d.get("pnl_pic", "")
-        print(f"[DEBUG] stats_1d: buy_num={wallet_data['stats_1d'].get('buy_num')}, sell_num={wallet_data['stats_1d'].get('sell_num')}, total_transaction_num={wallet_data['stats_1d'].get('total_transaction_num')}")
-        print(f"[DEBUG] stats_7d: buy_num={wallet_data['stats_7d'].get('buy_num')}, sell_num={wallet_data['stats_7d'].get('sell_num')}, total_transaction_num={wallet_data['stats_7d'].get('total_transaction_num')}")
-        print(f"[DEBUG] stats_30d: buy_num={wallet_data['stats_30d'].get('buy_num')}, sell_num={wallet_data['stats_30d'].get('sell_num')}, total_transaction_num={wallet_data['stats_30d'].get('total_transaction_num')}")
+        # print(f"[DEBUG] stats_1d: buy_num={wallet_data['stats_1d'].get('buy_num')}, sell_num={wallet_data['stats_1d'].get('sell_num')}, total_transaction_num={wallet_data['stats_1d'].get('total_transaction_num')}")
+        # print(f"[DEBUG] stats_7d: buy_num={wallet_data['stats_7d'].get('buy_num')}, sell_num={wallet_data['stats_7d'].get('sell_num')}, total_transaction_num={wallet_data['stats_7d'].get('total_transaction_num')}")
+        # print(f"[DEBUG] stats_30d: buy_num={wallet_data['stats_30d'].get('buy_num')}, sell_num={wallet_data['stats_30d'].get('sell_num')}, total_transaction_num={wallet_data['stats_30d'].get('total_transaction_num')}")
         
-        await write_wallet_data_to_db(session, wallet_data, chain)
+        # 將錢包資料寫入資料庫並取得 SQLAlchemy 物件
+        wallet_obj = await write_wallet_data_to_db(session, wallet_data, chain)
+
+        # 若成功取得錢包物件，轉換並推送至 API
+        if wallet_obj:
+            try:
+                api_dict = wallet_to_api_dict(wallet_obj)
+                if api_dict:
+                    batch_api_data.append(api_dict)
+            except Exception as api_err:
+                logging.error(f"轉換/批次收集錢包 {wallet_address} 失敗: {api_err}")
+        
         current_timestamp = int(time.time())
         thirty_days_ago = current_timestamp - (30 * 24 * 60 * 60)
         if (
@@ -889,15 +929,18 @@ async def update_smart_wallets_filter(wallet_transactions, bnb_usdt_price, sessi
             float(stats_30d.get("asset_multiple", 0)) > 0.3 and
             stats_30d.get("total_transaction_num", 0) < 2000 and
             last_transaction_time >= thirty_days_ago
-        ):            
-            return True  # 返回 True 表示满足条件
-        else:
-            return False
+        ):
+            smart_wallet_found = True
+
+    # 迴圈結束後，批量推送一次 API
+    await push_wallets_batch(batch_api_data)
+
+    return smart_wallet_found
 
 async def update_smart_money_data(session, wallet_address, chain, bnb_usdt_price, is_smart_wallet=None, wallet_type=None, days=30, limit=100):
     """查詢指定錢包過去30天內的所有交易數據並分析"""
     client = os.getenv('RPC_URL')
-    print(f"正在查詢 {wallet_address} 錢包 {days} 天內的交易數據...")
+    # print(f"正在查詢 {wallet_address} 錢包 {days} 天內的交易數據...")
 
     wallet_transactions = {wallet_address: []}  # 改用普通字典而不是 defaultdict
     # 确保 bnb_usdt_price 是 Decimal 类型
@@ -938,7 +981,7 @@ async def update_smart_money_data(session, wallet_address, chain, bnb_usdt_price
         wallet_transactions[wallet_address].append(transaction)
         # print(f"Added transaction for {wallet_address}: {transaction}")
 
-    print(f"Total transactions for {wallet_address}: {len(wallet_transactions[wallet_address])}")
+    # print(f"Total transactions for {wallet_address}: {len(wallet_transactions[wallet_address])}")
     formatted_transactions = convert_transaction_format(wallet_transactions, wallet_address, bnb_usdt_price)
     # print(f"Formatted transactions: {formatted_transactions}")
     
@@ -976,7 +1019,10 @@ async def get_smart_wallets(session, chain):
     schema = 'dex_query_v1'
     WalletSummary.with_schema(schema)
     result = await session.execute(
-        select(WalletSummary.wallet_address).where(WalletSummary.is_smart_wallet == True)
+        select(WalletSummary.wallet_address).where(
+            WalletSummary.is_smart_wallet == True,
+            WalletSummary.chain == chain
+        )
     )
     return [row[0] for row in result]
 

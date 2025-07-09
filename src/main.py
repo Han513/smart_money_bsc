@@ -108,7 +108,7 @@ async def heartbeat():
         return jsonify({"status": "ERROR", "message": f"服務檢查失敗: {str(e)}"}), 500
 
 # 設置定期的心跳檢查任務（例如每分鐘檢查一次）
-@scheduler.scheduled_job('interval', minutes=1)
+@scheduler.scheduled_job('interval', minutes=60)
 async def scheduled_heartbeat_check():
     try:
         # 使用 test_client 來發送心跳請求

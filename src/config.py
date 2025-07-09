@@ -20,5 +20,12 @@ HELIUS_API_KEY = "16e9dd4d-4cf7-4c69-8c2d-fafa13b03423"
 BACKEND_HOST = os.getenv('BACKEND_HOST', 'localhost')
 BACKEND_PORT = os.getenv('BACKEND_PORT', '4200')
 
+# Redis 配置
+REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
+REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
+REDIS_PASSWORD = os.getenv('REDIS_PASSWORD')
+REDIS_DB = int(os.getenv('REDIS_DB', 0))
+REDIS_POOL_SIZE = int(os.getenv('REDIS_POOL_SIZE', 10))
+
 KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
 KAFKA_TOPIC = os.getenv('KAFKA_TOPIC', 'trade_events')

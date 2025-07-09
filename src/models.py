@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, Text, select, update, Index, text, distinct, case, delete, BIGINT, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, Text, select, update, Index, text, distinct, case, delete, BIGINT, UniqueConstraint, PrimaryKeyConstraint
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.declarative import as_declarative, declared_attr
 from config import *
@@ -228,11 +228,15 @@ class Holding(Base):
 class Transaction(Base):
     __tablename__ = 'wallet_transaction'
     __table_args__ = (
-        UniqueConstraint('wallet_address', 'token_address', 'transaction_time', 'signature', name='wallet_transaction_pkey'),
+        # 把組合鍵直接設為 PK
+        PrimaryKeyConstraint(
+            'wallet_address', 'token_address', 'transaction_time', 'signature',
+            name='wallet_transaction_pkey'   # 沿用原來名稱 OK
+        ),
         {'schema': 'dex_query_v1'}
     )
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(Integer, autoincrement=True)
     wallet_address = Column(String(100), nullable=False, comment="聰明錢錢包地址")
     wallet_balance = Column(Float, nullable=True, comment="錢包餘額")
     token_address = Column(String(100), nullable=False, comment="代幣地址")
@@ -347,29 +351,31 @@ def convert_to_decimal(value: Union[float, str, None]) -> Union[Decimal, None]:
 
 async def write_wallet_data_to_db(session, wallet_data, chain, twitter_name: Optional[str] = None, twitter_username: Optional[str] = None):
     try:
-        # 確保 update_time 是 naive datetime
         if isinstance(wallet_data.get('update_time'), datetime):
             wallet_data['update_time'] = wallet_data['update_time'].replace(tzinfo=None)
             
-        # 自動補齊last_transaction_time與chain_id
         if 'last_transaction_time' not in wallet_data:
             wallet_data['last_transaction_time'] = 0
         if 'chain_id' not in wallet_data or wallet_data['chain_id'] is None:
             chain_map = {'BSC': 9006, 'SOLANA': 501}
             wallet_data['chain_id'] = chain_map.get(wallet_data.get('chain', 'BSC').upper(), 9006)
 
-        # 檢查錢包是否已存在
         existing_wallet = await session.execute(
             select(WalletSummary).where(WalletSummary.wallet_address == wallet_data['wallet_address'])
         )
         existing_wallet = existing_wallet.scalar_one_or_none()
 
         if existing_wallet:
-            # 更新已存在的錢包
             logger.info(f"更新已存在的錢包: {wallet_data['wallet_address']}")
             for key, value in wallet_data.items():
+                if key == 'tag':
+                    continue
+
                 if hasattr(existing_wallet, key):
-                    setattr(existing_wallet, key, value)
+                    if value is not None:
+                        setattr(existing_wallet, key, value)
+                    else:
+                        pass
             
             # 更新 Twitter 信息
             if twitter_name is not None:
@@ -377,10 +383,16 @@ async def write_wallet_data_to_db(session, wallet_data, chain, twitter_name: Opt
             if twitter_username is not None:
                 existing_wallet.twitter_username = twitter_username
                 
+            # 若標籤為 kol，自動啟用 is_active
+            try:
+                if (existing_wallet.tag or '').lower() == 'kol':
+                    existing_wallet.is_active = True
+            except Exception:
+                pass
+                
             await session.commit()
             return existing_wallet
         else:
-            # 創建新錢包
             logger.info(f"創建新錢包: {wallet_data['wallet_address']}")
             new_wallet = WalletSummary(**wallet_data)
             if twitter_name is not None:
@@ -388,6 +400,12 @@ async def write_wallet_data_to_db(session, wallet_data, chain, twitter_name: Opt
             if twitter_username is not None:
                 new_wallet.twitter_username = twitter_username
             session.add(new_wallet)
+            # 若標籤為 kol，直接設置 is_active = True
+            try:
+                if (getattr(new_wallet, 'tag', '') or '').lower() == 'kol':
+                    new_wallet.is_active = True
+            except Exception:
+                pass
             await session.commit()
             return new_wallet
     except Exception as e:
@@ -1253,7 +1271,29 @@ def wallet_to_api_dict(wallet) -> dict:
             "total_cost_1d": "totalCost1d",
             "avg_realized_profit_30d": "avgRealizedProfit30d",
             "avg_realized_profit_7d": "avgRealizedProfit7d",
-            "avg_realized_profit_1d": "avgRealizedProfit1d"
+            "avg_realized_profit_1d": "avgRealizedProfit1d",
+            # 收益分布（次數）
+            "distribution_gt500_30d": "distributionGt500_30d",
+            "distribution_200to500_30d": "distribution200to500_30d",
+            "distribution_0to200_30d": "distribution0to200_30d",
+            "distribution_0to50_30d": "distribution0to50_30d",
+            "distribution_lt50_30d": "distributionLt50_30d",
+            "distribution_gt500_7d": "distributionGt500_7d",
+            "distribution_200to500_7d": "distribution200to500_7d",
+            "distribution_0to200_7d": "distribution0to200_7d",
+            "distribution_0to50_7d": "distribution0to50_7d",
+            "distribution_lt50_7d": "distributionLt50_7d",
+            # 收益分布（百分比）
+            "distribution_gt500_percentage_30d": "distributionGt500Percentage30d",
+            "distribution_200to500_percentage_30d": "distribution200to500Percentage30d",
+            "distribution_0to200_percentage_30d": "distribution0to200Percentage30d",
+            "distribution_0to50_percentage_30d": "distribution0to50Percentage30d",
+            "distribution_lt50_percentage_30d": "distributionLt50Percentage30d",
+            "distribution_gt500_percentage_7d": "distributionGt500Percentage7d",
+            "distribution_200to500_percentage_7d": "distribution200to500Percentage7d",
+            "distribution_0to200_percentage_7d": "distribution0to200Percentage7d",
+            "distribution_0to50_percentage_7d": "distribution0to50Percentage7d",
+            "distribution_lt50_percentage_7d": "distributionLt50Percentage7d"
         }
         
         # 定義需要限制小數位數的數值字段（移除字符串字段）
@@ -1268,7 +1308,11 @@ def wallet_to_api_dict(wallet) -> dict:
             "pnl_percentage_30d", "pnl_percentage_7d", "pnl_percentage_1d",
             "unrealized_profit_30d", "unrealized_profit_7d", "unrealized_profit_1d",
             "total_cost_30d", "total_cost_7d", "total_cost_1d",
-            "avg_realized_profit_30d", "avg_realized_profit_7d", "avg_realized_profit_1d"
+            "avg_realized_profit_30d", "avg_realized_profit_7d", "avg_realized_profit_1d",
+            "distribution_gt500_30d", "distribution_200to500_30d", "distribution_0to200_30d", "distribution_0to50_30d", "distribution_lt50_30d",
+            "distribution_gt500_7d", "distribution_200to500_7d", "distribution_0to200_7d", "distribution_0to50_7d", "distribution_lt50_7d",
+            "distribution_gt500_percentage_30d", "distribution_200to500_percentage_30d", "distribution_0to200_percentage_30d", "distribution_0to50_percentage_30d", "distribution_lt50_percentage_30d",
+            "distribution_gt500_percentage_7d", "distribution_200to500_percentage_7d", "distribution_0to200_percentage_7d", "distribution_0to50_percentage_7d", "distribution_lt50_percentage_7d"
         }
 
         # 定義字符串字段

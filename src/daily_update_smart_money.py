@@ -286,9 +286,8 @@ def log_execution_time(func):
     return wrapper
 
 def get_update_time():
-    """獲取當前時間（UTC+8）格式化為字符串"""
-    now_utc = now_utc_plus_8
-    utc_plus_8 = now_utc + timedelta(hours=8)
+    """動態獲取當前 UTC+8 時間格式化為字符串"""
+    utc_plus_8 = datetime.utcnow() + timedelta(hours=8)
     return utc_plus_8.strftime("%Y-%m-%d %H:%M:%S")
 
 def make_naive_time(dt):
@@ -1394,11 +1393,11 @@ async def execute_daily_task():
             return
         
         # 清理資料庫中的無效資料
-        try:
-            logger.info("開始清理資料庫中的無效數據")
-            await clean_all_bsc_related_data()
-        except Exception as e:
-            logger.error(f"清理資料庫失敗: {str(e)}")
+        # try:
+        #     logger.info("開始清理資料庫中的無效數據")
+        #     await clean_all_bsc_related_data()
+        # except Exception as e:
+        #     logger.error(f"清理資料庫失敗: {str(e)}")
         
         # 更新 BSC 智能錢包數據
         try:
